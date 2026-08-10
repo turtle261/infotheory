@@ -277,6 +277,13 @@ pub fn run_ac_log_loss_mixture_bytes(
     out_prefix: impl AsRef<Path>,
 ) -> Result<AcLogLossRunSummary> {
     spec.validate().map_err(anyhow::Error::msg)?;
+    if matches!(spec.kind, crate::api::MixtureKind::Logistic)
+        && crate::neural_mix::logistic_stretch_mixer_active(spec.experts.len())
+    {
+        bail!(
+            "ac-log-loss diagnostics are not supported for logistic mixtures (stretch-domain bit mixer has no truthful simplex expert-weight decomposition yet)"
+        );
+    }
 
     let out_prefix = out_prefix.as_ref();
     if let Some(parent) = out_prefix.parent()
@@ -541,7 +548,6 @@ pub fn run_ac_log_loss_mixture_bytes(
 mod tests {
     use super::*;
 
-    #[cfg(feature = "backend-mixture")]
     fn test_nested_spec(base: RateBackend) -> MixtureSpec {
         MixtureSpec::new(
             MixtureKind::Switching,
@@ -668,6 +674,54 @@ mod tests {
         )
         .expect("raw ac compression");
         assert_eq!(summary.ac_payload_bits_raw, (encoded.len() as u64) * 8);
+        let _ = std::fs::remove_file(summary.trace_path);
+        let _ = std::fs::remove_file(summary.nodes_path);
+        let _ = std::fs::remove_file(summary.summary_path);
+    }
+
+    #[cfg(all(feature = "backend-mixture", feature = "backend-rosa"))]
+    #[test]
+    fn logistic_mixture_ac_log_loss_is_rejected() {
+        let experts = vec![
+            MixtureExpertSpec::new(RateBackend::RosaPlus { max_order: -1 }),
+            MixtureExpertSpec::new(RateBackend::RosaPlus { max_order: 4 }),
+        ];
+        let spec = MixtureSpec::new(MixtureKind::Logistic, experts).with_alpha(0.03);
+        let prefix = std::env::temp_dir().join(format!(
+            "infotheory_ac_diag_logistic_reject_{}",
+            std::process::id()
+        ));
+        let err = run_ac_log_loss_mixture_bytes(b"x", &spec, &prefix)
+            .expect_err("logistic diagnostics must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not supported for logistic"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[cfg(all(feature = "backend-mixture", feature = "backend-rosa"))]
+    #[test]
+    fn one_expert_logistic_ac_log_loss_uses_the_truthful_identity_model() {
+        let spec = MixtureSpec::new(
+            MixtureKind::Logistic,
+            vec![MixtureExpertSpec::new(RateBackend::RosaPlus {
+                max_order: 4,
+            })],
+        )
+        .with_alpha(0.03);
+        let prefix = std::env::temp_dir().join(format!(
+            "infotheory_ac_diag_logistic_identity_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let summary = run_ac_log_loss_mixture_bytes(b"identity diagnostic", &spec, &prefix)
+            .expect("one-expert logistic diagnostics should be exact and supported");
+        assert_eq!(summary.positions, b"identity diagnostic".len());
+        assert!(summary.mix_total_bits.is_finite());
         let _ = std::fs::remove_file(summary.trace_path);
         let _ = std::fs::remove_file(summary.nodes_path);
         let _ = std::fs::remove_file(summary.summary_path);

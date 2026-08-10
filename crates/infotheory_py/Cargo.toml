@@ -33,6 +33,7 @@ capability-statistical = [
     "backend-rosa",
     "backend-ctw",
     "backend-match",
+    "backend-context",
     "backend-ppmd",
     "backend-sequitur",
     "backend-mixture",
@@ -41,6 +42,7 @@ capability-statistical = [
 ]
 capability-neural = [
     "infotheory/capability-neural",
+    "backend-bit-reservoir",
     "backend-mamba",
     "backend-rwkv",
 ]
@@ -61,11 +63,13 @@ python-extension = ["pyo3/extension-module", "aixi"]
 backend-rosa = ["infotheory/backend-rosa"]
 backend-ctw = ["infotheory/backend-ctw"]
 backend-match = ["infotheory/backend-match"]
+backend-context = ["infotheory/backend-context"]
 backend-ppmd = ["infotheory/backend-ppmd"]
 backend-sequitur = ["infotheory/backend-sequitur"]
 backend-mixture = ["infotheory/backend-mixture"]
 backend-particle = ["infotheory/backend-particle"]
 backend-calibrated = ["infotheory/backend-calibrated"]
+backend-bit-reservoir = ["infotheory/backend-bit-reservoir"]
 backend-mamba = ["infotheory/backend-mamba"]
 backend-rwkv = ["infotheory/backend-rwkv"]
 backend-zpaq = ["infotheory/backend-zpaq"]

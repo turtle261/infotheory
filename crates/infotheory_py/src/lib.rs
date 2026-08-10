@@ -1,11 +1,14 @@
 #![allow(clippy::needless_pass_by_value)]
 
+#[cfg(feature = "backend-bit-reservoir")]
+use infotheory::api::BitReservoirConfig;
 use infotheory::api::{
     self, BinaryPrediction, BitOrder, BitStreamSemantics, BytePrefixMass, CalibratedSpec,
-    CalibrationContextKind, CompiledCompressionBackend, CompiledRateBackend, CompressionBackend,
-    GenerationConfig, GenerationStrategy, GenerationUpdateMode, InfotheoryCtx, MixtureExpertSpec,
-    MixtureKind, MixtureScheduleMode, MixtureSpec, NcdVariant, OnlineBitPredictor, ParticleSpec,
-    RateBackend, RateBackendBitSession, RateBackendBitSessionCheckpoint, RateBackendSession,
+    CalibrationContextKind, CalibrationTrainingMode, CompiledCompressionBackend,
+    CompiledRateBackend, CompressionBackend, GenerationConfig, GenerationStrategy,
+    GenerationUpdateMode, InfotheoryCtx, MixtureExpertSpec, MixtureKind, MixtureScheduleMode,
+    MixtureSpec, NcdVariant, OnlineBitPredictor, ParticleSpec, RateBackend, RateBackendBitSession,
+    RateBackendBitSessionCheckpoint, RateBackendSession,
 };
 use infotheory::error::InfotheoryError;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
@@ -387,6 +390,7 @@ fn parse_calibration_context_kind_alias(s: &str) -> Option<CalibrationContextKin
     match s.trim().to_ascii_lowercase().as_str() {
         "global" => Some(CalibrationContextKind::Global),
         "byteclass" => Some(CalibrationContextKind::ByteClass),
+        "order1" | "order-1" | "byte" => Some(CalibrationContextKind::Order1),
         "text" => Some(CalibrationContextKind::Text),
         "repeat" => Some(CalibrationContextKind::Repeat),
         "textrepeat" => Some(CalibrationContextKind::TextRepeat),
@@ -411,6 +415,30 @@ fn parse_calibration_context_kind_value(
     ))
 }
 
+fn parse_calibration_training_mode_alias(s: &str) -> Option<CalibrationTrainingMode> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "nearest" => Some(CalibrationTrainingMode::Nearest),
+        "interpolated" => Some(CalibrationTrainingMode::Interpolated),
+        _ => None,
+    }
+}
+
+fn parse_calibration_training_mode_value(
+    py_obj: &Bound<'_, PyAny>,
+) -> PyResult<CalibrationTrainingMode> {
+    if let Ok(mode) = py_obj.extract::<PyRef<'_, PyCalibrationTrainingMode>>() {
+        return Ok(mode.inner);
+    }
+    if let Ok(s) = py_obj.extract::<String>() {
+        return parse_calibration_training_mode_alias(&s).ok_or_else(|| {
+            PyValueError::new_err(format!("unknown calibration training mode '{s}'"))
+        });
+    }
+    Err(PyValueError::new_err(
+        "CalibrationTrainingMode must be a CalibrationTrainingMode enum value or string",
+    ))
+}
+
 fn parse_rate_backend(name: &str, method: Option<&str>) -> PyResult<RateBackend> {
     let opts = infotheory::spec::RateBackendShorthandOptions::default();
     infotheory::spec::parse_rate_backend_name_method(name, method, &opts)
@@ -427,10 +455,10 @@ fn parse_compression_backend(
     opts.default_framing = infotheory::compression::FramingMode::Framed;
 
     #[cfg(feature = "backend-rwkv")]
-    if name.trim().eq_ignore_ascii_case("rwkv7") {
-        if let Ok(path) = std::env::var("RWKV7_MODEL_PATH") {
-            opts.default_rwkv_model_path = Some(path);
-        }
+    if name.trim().eq_ignore_ascii_case("rwkv7")
+        && let Ok(path) = std::env::var("RWKV7_MODEL_PATH")
+    {
+        opts.default_rwkv_model_path = Some(path);
     }
     infotheory::spec::parse_compression_backend_name_method(name, method, None, &opts)
         .map_err(py_spec_value_error)
@@ -484,6 +512,13 @@ impl PyMixtureKind {
     fn neural() -> Self {
         Self {
             inner: MixtureKind::Neural,
+        }
+    }
+    #[classattr]
+    #[pyo3(name = "Logistic")]
+    fn logistic() -> Self {
+        Self {
+            inner: MixtureKind::Logistic,
         }
     }
 }
@@ -697,6 +732,14 @@ impl PyCalibrationContextKind {
     }
 
     #[classattr]
+    #[pyo3(name = "Order1")]
+    fn order1() -> Self {
+        Self {
+            inner: CalibrationContextKind::Order1,
+        }
+    }
+
+    #[classattr]
     #[pyo3(name = "Text")]
     fn text() -> Self {
         Self {
@@ -724,10 +767,44 @@ impl PyCalibrationContextKind {
         match self.inner {
             CalibrationContextKind::Global => "CalibrationContextKind.Global",
             CalibrationContextKind::ByteClass => "CalibrationContextKind.ByteClass",
+            CalibrationContextKind::Order1 => "CalibrationContextKind.Order1",
             CalibrationContextKind::Text => "CalibrationContextKind.Text",
             CalibrationContextKind::Repeat => "CalibrationContextKind.Repeat",
             CalibrationContextKind::TextRepeat => "CalibrationContextKind.TextRepeat",
             _ => "CalibrationContextKind.<unknown>",
+        }
+    }
+}
+
+#[pyclass(name = "CalibrationTrainingMode", from_py_object)]
+#[derive(Clone, Copy)]
+struct PyCalibrationTrainingMode {
+    inner: CalibrationTrainingMode,
+}
+
+#[pymethods]
+impl PyCalibrationTrainingMode {
+    #[classattr]
+    #[pyo3(name = "Nearest")]
+    fn nearest() -> Self {
+        Self {
+            inner: CalibrationTrainingMode::Nearest,
+        }
+    }
+
+    #[classattr]
+    #[pyo3(name = "Interpolated")]
+    fn interpolated() -> Self {
+        Self {
+            inner: CalibrationTrainingMode::Interpolated,
+        }
+    }
+
+    fn __repr__(&self) -> &'static str {
+        match self.inner {
+            CalibrationTrainingMode::Nearest => "CalibrationTrainingMode.Nearest",
+            CalibrationTrainingMode::Interpolated => "CalibrationTrainingMode.Interpolated",
+            _ => "CalibrationTrainingMode.<unknown>",
         }
     }
 }
@@ -828,11 +905,103 @@ impl PyRateBackend {
     }
 
     #[staticmethod]
+    #[pyo3(signature = (order=2, hash_bits=16))]
+    fn order_ngram(order: usize, hash_bits: usize) -> Self {
+        Self {
+            inner: RateBackend::OrderNGram { order, hash_bits },
+        }
+    }
+
+    #[staticmethod]
+    #[pyo3(signature = (hash_bits=16))]
+    fn word_context(hash_bits: usize) -> Self {
+        Self {
+            inner: RateBackend::WordContext { hash_bits },
+        }
+    }
+
+    #[staticmethod]
     #[pyo3(signature = (order=10, memory_mb=64))]
     fn ppmd(order: usize, memory_mb: usize) -> Self {
         Self {
             inner: RateBackend::Ppmd { order, memory_mb },
         }
+    }
+
+    #[staticmethod]
+    #[cfg(feature = "backend-bit-reservoir")]
+    #[pyo3(signature = (
+        hidden=None,
+        delay_bits=None,
+        embedding_bits=None,
+        learning_rate=None,
+        learning_rate_decay=None,
+        weight_decay=None,
+        state_decay=None,
+        recurrent_scale=None,
+        input_scale=None,
+        phase_scale=None,
+        grad_clip=None,
+        seed=None
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn bit_reservoir(
+        hidden: Option<usize>,
+        delay_bits: Option<usize>,
+        embedding_bits: Option<usize>,
+        learning_rate: Option<f64>,
+        learning_rate_decay: Option<f64>,
+        weight_decay: Option<f64>,
+        state_decay: Option<f64>,
+        recurrent_scale: Option<f64>,
+        input_scale: Option<f64>,
+        phase_scale: Option<f64>,
+        grad_clip: Option<f64>,
+        seed: Option<u64>,
+    ) -> PyResult<Self> {
+        let mut config = BitReservoirConfig::default();
+        if let Some(hidden) = hidden {
+            config.hidden = hidden;
+        }
+        if let Some(delay_bits) = delay_bits {
+            config.delay_bits = delay_bits;
+        }
+        if let Some(embedding_bits) = embedding_bits {
+            config.embedding_bits = embedding_bits;
+        }
+        if let Some(learning_rate) = learning_rate {
+            config.learning_rate = learning_rate;
+        }
+        if let Some(learning_rate_decay) = learning_rate_decay {
+            config.learning_rate_decay = learning_rate_decay;
+        }
+        if let Some(weight_decay) = weight_decay {
+            config.weight_decay = weight_decay;
+        }
+        if let Some(state_decay) = state_decay {
+            config.state_decay = state_decay;
+        }
+        if let Some(recurrent_scale) = recurrent_scale {
+            config.recurrent_scale = recurrent_scale;
+        }
+        if let Some(input_scale) = input_scale {
+            config.input_scale = input_scale;
+        }
+        if let Some(phase_scale) = phase_scale {
+            config.phase_scale = phase_scale;
+        }
+        if let Some(grad_clip) = grad_clip {
+            config.grad_clip = grad_clip;
+        }
+        if let Some(seed) = seed {
+            config.seed = seed;
+        }
+        config
+            .validate()
+            .map_err(|e| PyValueError::new_err(format!("invalid BitReservoirConfig: {e}")))?;
+        Ok(Self {
+            inner: RateBackend::BitReservoir { config },
+        })
     }
 
     #[staticmethod]
@@ -882,13 +1051,15 @@ impl PyRateBackend {
     }
 
     #[staticmethod]
-    #[pyo3(signature = (base_backend, context=None, bins=33, learning_rate=0.02, bias_clip=4.0))]
+    #[pyo3(signature = (base_backend, context=None, bins=33, learning_rate=0.02, bias_clip=4.0, blend=1.0, training_mode=None))]
     fn calibrated(
         base_backend: &PyRateBackend,
         context: Option<&Bound<'_, PyAny>>,
         bins: usize,
         learning_rate: f64,
         bias_clip: f64,
+        blend: f64,
+        training_mode: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
         let context_kind = context
             .map(parse_calibration_context_kind_value)
@@ -898,6 +1069,11 @@ impl PyRateBackend {
         cal_spec.bins = bins;
         cal_spec.learning_rate = learning_rate;
         cal_spec.bias_clip = bias_clip;
+        cal_spec.blend = blend;
+        cal_spec.training_mode = training_mode
+            .map(parse_calibration_training_mode_value)
+            .transpose()?
+            .unwrap_or(CalibrationTrainingMode::Nearest);
         Ok(Self {
             inner: RateBackend::Calibrated {
                 spec: Arc::new(cal_spec),
@@ -1166,6 +1342,16 @@ impl PyInfotheoryCtx {
             py_try(|| {
                 self.inner
                     .try_intrinsic_dependence_bytes(data)
+                    .map_err(py_infotheory_error)
+            })
+        })
+    }
+
+    fn intrinsic_dependence_bits(&self, py: Python<'_>, data: &[u8]) -> PyResult<f64> {
+        py.detach(|| {
+            py_try(|| {
+                self.inner
+                    .try_intrinsic_dependence_bits(data)
                     .map_err(py_infotheory_error)
             })
         })
@@ -2034,6 +2220,76 @@ fn empirical_joint_entropy_bytes(x: &[u8], y: &[u8]) -> f64 {
     api::empirical_joint_entropy_bytes(x, y)
 }
 
+#[pyfunction]
+fn empirical_entropy_bits(data: &[u8]) -> f64 {
+    api::empirical_entropy_bits(data)
+}
+
+#[pyfunction]
+fn empirical_joint_entropy_bits(x: &[u8], y: &[u8]) -> f64 {
+    api::empirical_joint_entropy_bits(x, y)
+}
+
+#[pyfunction]
+fn empirical_mutual_information_bits(x: &[u8], y: &[u8]) -> f64 {
+    api::empirical_mutual_information_bits(x, y)
+}
+
+#[pyfunction]
+fn empirical_cross_entropy_bits(test_data: &[u8], train_data: &[u8]) -> f64 {
+    api::empirical_cross_entropy_bits(test_data, train_data)
+}
+
+#[pyfunction]
+fn tvd_bits(x: &[u8], y: &[u8]) -> f64 {
+    api::tvd_bits(x, y)
+}
+
+#[pyfunction]
+fn nhd_bits(x: &[u8], y: &[u8]) -> f64 {
+    api::nhd_bits(x, y)
+}
+
+#[pyfunction]
+fn d_kl_bits(x: &[u8], y: &[u8]) -> f64 {
+    api::d_kl_bits(x, y)
+}
+
+#[pyfunction]
+fn js_div_bits(x: &[u8], y: &[u8]) -> f64 {
+    api::js_div_bits(x, y)
+}
+
+#[pyfunction]
+fn empirical_ned_bits(x: &[u8], y: &[u8]) -> f64 {
+    api::empirical_ned_bits(x, y)
+}
+
+#[pyfunction]
+fn empirical_ned_cons_bits(x: &[u8], y: &[u8]) -> f64 {
+    api::empirical_ned_cons_bits(x, y)
+}
+
+#[pyfunction]
+fn empirical_nte_bits(x: &[u8], y: &[u8]) -> f64 {
+    api::empirical_nte_bits(x, y)
+}
+
+#[pyfunction]
+fn empirical_resistance_to_transformation_bits(x: &[u8], tx: &[u8]) -> f64 {
+    api::empirical_resistance_to_transformation_bits(x, tx)
+}
+
+#[pyfunction]
+fn entropy_rate_per_bit(py: Python<'_>, data: &[u8]) -> PyResult<f64> {
+    py.detach(|| py_try(|| api::try_entropy_rate_per_bit(data).map_err(py_infotheory_error)))
+}
+
+#[pyfunction]
+fn biased_entropy_rate_per_bit(py: Python<'_>, data: &[u8]) -> PyResult<f64> {
+    py.detach(|| py_try(|| api::try_biased_entropy_rate_per_bit(data).map_err(py_infotheory_error)))
+}
+
 macro_rules! py_metric_bytes_2 {
     ($fn_name:ident, $target:path) => {
         #[pyfunction]
@@ -2084,6 +2340,32 @@ py_metric_bytes_2!(nhd_bytes, api::nhd_bytes);
 py_metric_bytes_2_try!(cross_entropy_bytes, api::try_cross_entropy_bytes);
 py_metric_bytes_2_try!(cross_entropy_rate_bytes, api::try_cross_entropy_rate_bytes);
 
+// Algorithmic per-bit wrappers (binary arity). Unary per-bit wrappers are
+// hand-written above to match entropy_rate_bytes / biased_entropy_rate_bytes.
+py_metric_bytes_2_try!(
+    joint_entropy_rate_per_bit,
+    api::try_joint_entropy_rate_per_bit
+);
+py_metric_bytes_2_try!(
+    cross_entropy_rate_per_bit,
+    api::try_cross_entropy_rate_per_bit
+);
+py_metric_bytes_2_try!(
+    mutual_information_rate_per_bit,
+    api::try_mutual_information_rate_per_bit
+);
+py_metric_bytes_2_try!(
+    conditional_entropy_rate_per_bit,
+    api::try_conditional_entropy_rate_per_bit
+);
+py_metric_bytes_2_try!(ned_rate_per_bit, api::try_ned_rate_per_bit);
+py_metric_bytes_2_try!(ned_cons_rate_per_bit, api::try_ned_cons_rate_per_bit);
+py_metric_bytes_2_try!(nte_rate_per_bit, api::try_nte_rate_per_bit);
+py_metric_bytes_2_try!(
+    resistance_to_transformation_per_bit,
+    api::try_resistance_to_transformation_per_bit
+);
+
 py_metric_paths_2_try!(ned_paths, api::try_ned_paths);
 py_metric_paths_2_try!(nte_paths, api::try_nte_paths);
 py_metric_paths_2_try!(tvd_paths, api::try_tvd_paths);
@@ -2118,6 +2400,11 @@ fn js_divergence_paths(py: Python<'_>, x: &str, y: &str) -> PyResult<f64> {
 #[pyfunction]
 fn intrinsic_dependence_bytes(py: Python<'_>, data: &[u8]) -> PyResult<f64> {
     py.detach(|| py_try(|| api::try_intrinsic_dependence_bytes(data).map_err(py_infotheory_error)))
+}
+
+#[pyfunction]
+fn intrinsic_dependence_bits(py: Python<'_>, data: &[u8]) -> PyResult<f64> {
+    py.detach(|| py_try(|| api::try_intrinsic_dependence_bits(data).map_err(py_infotheory_error)))
 }
 
 #[pyfunction]
@@ -3159,10 +3446,10 @@ impl infotheory::aixi::environment::Environment for PyEnvironmentShim {
         Python::attach(|py| {
             let guard = lock_recover(&self.obj);
             let obj = guard.bind(py);
-            if py_hasattr_or_fatal(obj, "set_random_seed", "Environment.set_random_seed") {
-                if let Err(e) = obj.call_method1("set_random_seed", (seed,)) {
-                    fatal_python_callback_error(py, "Environment.set_random_seed", e);
-                }
+            if py_hasattr_or_fatal(obj, "set_random_seed", "Environment.set_random_seed")
+                && let Err(e) = obj.call_method1("set_random_seed", (seed,))
+            {
+                fatal_python_callback_error(py, "Environment.set_random_seed", e);
             }
         });
     }
@@ -3599,6 +3886,9 @@ struct AixiRunSummary {
     prev_action=0,
     check_finished=false
 ))]
+// The explicit keyword surface is a stable Python API; grouping it into a
+// Rust-only options object would make the binding less truthful and ergonomic.
+#[allow(clippy::too_many_arguments)]
 fn run_agent_with_environment<'py>(
     py: Python<'py>,
     environment: Py<PyAny>,
@@ -3775,6 +4065,9 @@ fn run_agent_with_environment<'py>(
     explore_gamma=1.0,
     check_finished=false
 ))]
+// The explicit keyword surface is a stable Python API; grouping it into a
+// Rust-only options object would make the binding less truthful and ergonomic.
+#[allow(clippy::too_many_arguments)]
 fn run_aiqi_with_environment<'py>(
     py: Python<'py>,
     environment: Py<PyAny>,
@@ -5025,6 +5318,9 @@ impl PyStage2PriorMode {
     compression_backend=None,
     method=None
 ))]
+// These keyword controls form the public Python search API and intentionally
+// remain explicit instead of being hidden behind an opaque binding-only type.
+#[allow(clippy::too_many_arguments)]
 fn search(
     py: Python<'_>,
     query: &str,
@@ -5098,6 +5394,7 @@ fn _core(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyMixtureSpec>()?;
     m.add_class::<PyParticleSpec>()?;
     m.add_class::<PyCalibrationContextKind>()?;
+    m.add_class::<PyCalibrationTrainingMode>()?;
     m.add_class::<PyNcdVariant>()?;
     m.add_class::<PyObservationKeyMode>()?;
     m.add_class::<PyMctsStrategy>()?;
@@ -5171,6 +5468,32 @@ fn _core(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(ncd_matrix_paths_with_backend, m)?)?;
     m.add_function(wrap_pyfunction!(ncd_matrix_bytes_with_backend, m)?)?;
     m.add_function(wrap_pyfunction!(empirical_entropy_bytes, m)?)?;
+    m.add_function(wrap_pyfunction!(empirical_entropy_bits, m)?)?;
+    m.add_function(wrap_pyfunction!(empirical_joint_entropy_bits, m)?)?;
+    m.add_function(wrap_pyfunction!(empirical_mutual_information_bits, m)?)?;
+    m.add_function(wrap_pyfunction!(empirical_cross_entropy_bits, m)?)?;
+    m.add_function(wrap_pyfunction!(tvd_bits, m)?)?;
+    m.add_function(wrap_pyfunction!(nhd_bits, m)?)?;
+    m.add_function(wrap_pyfunction!(d_kl_bits, m)?)?;
+    m.add_function(wrap_pyfunction!(js_div_bits, m)?)?;
+    m.add_function(wrap_pyfunction!(empirical_ned_bits, m)?)?;
+    m.add_function(wrap_pyfunction!(empirical_ned_cons_bits, m)?)?;
+    m.add_function(wrap_pyfunction!(empirical_nte_bits, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        empirical_resistance_to_transformation_bits,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(entropy_rate_per_bit, m)?)?;
+    m.add_function(wrap_pyfunction!(biased_entropy_rate_per_bit, m)?)?;
+    m.add_function(wrap_pyfunction!(joint_entropy_rate_per_bit, m)?)?;
+    m.add_function(wrap_pyfunction!(cross_entropy_rate_per_bit, m)?)?;
+    m.add_function(wrap_pyfunction!(mutual_information_rate_per_bit, m)?)?;
+    m.add_function(wrap_pyfunction!(conditional_entropy_rate_per_bit, m)?)?;
+    m.add_function(wrap_pyfunction!(ned_rate_per_bit, m)?)?;
+    m.add_function(wrap_pyfunction!(ned_cons_rate_per_bit, m)?)?;
+    m.add_function(wrap_pyfunction!(nte_rate_per_bit, m)?)?;
+    m.add_function(wrap_pyfunction!(resistance_to_transformation_per_bit, m)?)?;
+
     m.add_function(wrap_pyfunction!(entropy_rate_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(entropy_rate_backend, m)?)?;
     m.add_function(wrap_pyfunction!(biased_entropy_rate_bytes, m)?)?;
@@ -5212,6 +5535,7 @@ fn _core(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(kl_divergence_paths, m)?)?;
     m.add_function(wrap_pyfunction!(js_divergence_paths, m)?)?;
     m.add_function(wrap_pyfunction!(intrinsic_dependence_bytes, m)?)?;
+    m.add_function(wrap_pyfunction!(intrinsic_dependence_bits, m)?)?;
     m.add_function(wrap_pyfunction!(resistance_to_transformation_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(verify_identity, m)?)?;
     m.add_function(wrap_pyfunction!(verify_symmetry, m)?)?;
@@ -5299,6 +5623,44 @@ mod tests {
         assert_eq!(framed, infotheory::compression::FramingMode::Framed);
         assert!(parse_framing_mode("frame").is_err());
         assert!(parse_framing_mode("nope").is_err());
+    }
+
+    #[test]
+    fn rate_backend_context_constructors_map_to_typed_variants() {
+        let ngram = PyRateBackend::order_ngram(3, 12);
+        match ngram.inner {
+            RateBackend::OrderNGram { order, hash_bits } => {
+                assert_eq!(order, 3);
+                assert_eq!(hash_bits, 12);
+            }
+            _ => panic!("expected order-ngram backend"),
+        }
+
+        let word = PyRateBackend::word_context(13);
+        match word.inner {
+            RateBackend::WordContext { hash_bits } => assert_eq!(hash_bits, 13),
+            _ => panic!("expected word-context backend"),
+        }
+    }
+
+    #[test]
+    fn calibration_context_order1_aliases_map_to_typed_variant() {
+        assert_eq!(
+            parse_calibration_context_kind_alias("order-1"),
+            Some(CalibrationContextKind::Order1)
+        );
+        assert_eq!(
+            PyCalibrationContextKind::order1().inner,
+            CalibrationContextKind::Order1
+        );
+        assert_eq!(
+            parse_calibration_training_mode_alias("interpolated"),
+            Some(CalibrationTrainingMode::Interpolated)
+        );
+        assert_eq!(
+            PyCalibrationTrainingMode::nearest().inner,
+            CalibrationTrainingMode::Nearest
+        );
     }
 
     #[test]

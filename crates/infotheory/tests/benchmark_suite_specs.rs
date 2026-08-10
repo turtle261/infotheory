@@ -84,6 +84,73 @@ fn two_json_benchmark_specs_are_pinned_and_canonical() {
 }
 
 #[test]
+fn one_sse_benchmark_specs_are_pinned_and_include_bit_reservoir() {
+    let root = repo_root();
+    let config_one_path = root.join("configs").join("bench").join("one.json");
+    let example_one_path = root.join("examples").join("one.json");
+    let config_one_raw = fs::read_to_string(&config_one_path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", config_one_path.display()));
+    let example_one_raw = fs::read_to_string(&example_one_path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", example_one_path.display()));
+    assert_eq!(
+        config_one_raw, example_one_raw,
+        "configs/bench/one.json and examples/one.json must stay byte-identical"
+    );
+
+    let config_sse_path = root.join("configs").join("bench").join("one_sse.json");
+    let example_sse_path = root.join("examples").join("one_sse.json");
+    let config_sse_raw = fs::read_to_string(&config_sse_path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", config_sse_path.display()));
+    let example_sse_raw = fs::read_to_string(&example_sse_path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", example_sse_path.display()));
+    assert_eq!(
+        config_sse_raw, example_sse_raw,
+        "configs/bench/one_sse.json and examples/one_sse.json must stay byte-identical"
+    );
+
+    let one: Value = serde_json::from_str(&config_one_raw)
+        .unwrap_or_else(|e| panic!("failed to parse {} as JSON: {e}", config_one_path.display()));
+    let experts = one["experts"]
+        .as_array()
+        .expect("one.json must contain experts array");
+    assert!(
+        experts
+            .iter()
+            .any(|expert| expert["kind"] == "bit-reservoir" && expert["name"] == "bit-reservoir"),
+        "one.json must include the canonical default bit-reservoir expert"
+    );
+
+    let one_sse: Value = serde_json::from_str(&config_sse_raw)
+        .unwrap_or_else(|e| panic!("failed to parse {} as JSON: {e}", config_sse_path.display()));
+    assert_eq!(one_sse["base"]["kind"], "mixture");
+    assert_eq!(one_sse["base"]["spec_path"], "one.json");
+    assert_eq!(one_sse["context"], "textrepeat");
+
+    #[cfg(all(
+        feature = "backend-calibrated",
+        feature = "backend-mixture",
+        feature = "backend-bit-reservoir",
+        feature = "backend-ppmd",
+        feature = "backend-rosa",
+        feature = "backend-match"
+    ))]
+    {
+        let spec = infotheory::spec::load_calibrated_spec(
+            config_sse_path
+                .to_str()
+                .expect("one_sse path should be UTF-8"),
+        )
+        .expect("one_sse.json should load as a calibrated spec");
+        let backend = infotheory::api::RateBackend::Calibrated {
+            spec: std::sync::Arc::new(spec),
+        };
+        backend
+            .compile()
+            .expect("one_sse calibrated backend should compile");
+    }
+}
+
+#[test]
 fn two_sse_profile_wraps_canonical_two_json() {
     let v = load_example("two_sse.json");
     assert_eq!(v["base"]["kind"], "mixture");
@@ -161,6 +228,112 @@ fn two_all_sse_profile_calibrates_root_and_each_expert() {
         backend
             .compile()
             .expect("two_all_sse calibrated backend should compile");
+    }
+}
+
+#[test]
+fn three_json_profile_is_logistic_context_sse_chain() {
+    let root = repo_root();
+    let config_path = root.join("configs").join("bench").join("three.json");
+    let example_path = root.join("examples").join("three.json");
+    let config_raw = fs::read_to_string(&config_path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", config_path.display()));
+    let example_raw = fs::read_to_string(&example_path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", example_path.display()));
+    assert_eq!(
+        config_raw, example_raw,
+        "configs/bench/three.json and examples/three.json must stay byte-identical"
+    );
+
+    let base_config_path = root.join("configs").join("bench").join("three_base.json");
+    let base_example_path = root.join("examples").join("three_base.json");
+    let base_config_raw = fs::read_to_string(&base_config_path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", base_config_path.display()));
+    let base_example_raw = fs::read_to_string(&base_example_path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", base_example_path.display()));
+    assert_eq!(
+        base_config_raw, base_example_raw,
+        "configs/bench/three_base.json and examples/three_base.json must stay byte-identical"
+    );
+
+    let v: Value = serde_json::from_str(&config_raw)
+        .unwrap_or_else(|e| panic!("failed to parse {} as JSON: {e}", config_path.display()));
+    assert_eq!(v["context"], "textrepeat");
+    assert_eq!(v["learning_rate"].as_f64(), Some(0.005));
+    assert_eq!(v["blend"].as_f64(), Some(0.1));
+    assert_eq!(v["training_mode"], "interpolated");
+    assert_eq!(v["base"]["kind"], "calibrated");
+    assert_eq!(v["base"]["spec"]["context"], "order1");
+    assert_eq!(v["base"]["spec"]["learning_rate"].as_f64(), Some(0.0078125));
+    assert_eq!(v["base"]["spec"]["blend"].as_f64(), Some(0.1));
+    assert_eq!(v["base"]["spec"]["training_mode"], "interpolated");
+    assert_eq!(v["base"]["spec"]["base"]["kind"], "mixture");
+    assert_eq!(v["base"]["spec"]["base"]["spec_path"], "three_base.json");
+
+    let base: Value = serde_json::from_str(&base_config_raw).unwrap_or_else(|e| {
+        panic!(
+            "failed to parse {} as JSON: {e}",
+            base_config_path.display()
+        )
+    });
+    assert_eq!(base["kind"], "logistic");
+    let experts = base["experts"]
+        .as_array()
+        .expect("three_base.json must contain experts array");
+    assert!(
+        experts
+            .iter()
+            .any(|expert| expert["kind"] == "sparse-match"),
+        "three_base.json must include sparse-match"
+    );
+    assert!(
+        experts
+            .iter()
+            .any(|expert| expert["kind"] == "word-context"),
+        "three_base.json must include word-context"
+    );
+    assert!(
+        experts
+            .iter()
+            .filter(|expert| expert["kind"] == "order-ngram")
+            .count()
+            >= 3,
+        "three_base.json must include order-N context counters"
+    );
+    assert!(
+        experts
+            .iter()
+            .any(|expert| expert["kind"] == "bit-reservoir"),
+        "three_base.json must include bit-reservoir"
+    );
+    assert!(
+        experts.iter().all(|expert| expert["kind"] != "rwkv7"),
+        "three_base.json leaves rwkv7 out until its marginal value is measured"
+    );
+
+    #[cfg(all(
+        feature = "backend-calibrated",
+        feature = "backend-mixture",
+        feature = "backend-ctw",
+        feature = "backend-ppmd",
+        feature = "backend-rosa",
+        feature = "backend-match",
+        feature = "backend-context",
+        feature = "backend-bit-reservoir"
+    ))]
+    {
+        let spec = infotheory::spec::load_calibrated_spec(
+            config_path
+                .to_str()
+                .expect("three.json path should be UTF-8"),
+        )
+        .expect("three.json should load as a calibrated spec");
+        let backend = infotheory::api::RateBackend::Calibrated {
+            spec: std::sync::Arc::new(spec),
+        };
+        backend
+            .compile()
+            .expect("three.json calibrated backend should compile");
     }
 }
 

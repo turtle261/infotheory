@@ -39,11 +39,15 @@ Usage:
 
 Core commands:
   h, entropy     Empirical byte entropy; uses rate backend when explicitly selected
+  h_bits         Empirical pooled-bit entropy (binary alphabet)
   h_rate         Algorithmic entropy rate via the active rate backend
+  h_rate_per_bit Algorithmic entropy rate in bits per bit (= h_rate / 8)
   mi, xe, ce     Mutual information, cross entropy, conditional entropy
   ncd            Normalized compression distance
   ned, nte       Normalized entropy distance and transform effort
   kl, js, tvd    Empirical byte-distribution divergences/distances
+  *_bits         Empirical bitwise (binary-alphabet) counterparts of mi/xe/kl/js/tvd/...
+  *_per_bit      Algorithmic bits-per-bit rates and scale-invariant aliases
   compress       Compress a file with the selected compression backend
   decompress     Decompress a framed file
   generate       Continue file or piped bytes with the active rate backend
@@ -91,27 +95,63 @@ pub(crate) fn print_topic_help(topic: &str) {
         "metrics"
         | "h"
         | "entropy"
+        | "h_bits"
+        | "entropy_bits"
         | "h_rate"
         | "entropy_rate"
+        | "h_rate_per_bit"
+        | "entropy_rate_per_bit"
+        | "biased_entropy_rate_per_bit"
         | "mi"
         | "mutual_info"
+        | "mi_bits"
+        | "mi_rate_per_bit"
+        | "mutual_information_rate_per_bit"
         | "xe"
         | "cross_entropy"
+        | "xe_bits"
+        | "cross_entropy_bits"
+        | "xe_rate_per_bit"
+        | "cross_entropy_rate_per_bit"
         | "ce"
         | "conditional_entropy"
+        | "ce_rate_per_bit"
+        | "conditional_entropy_rate_per_bit"
         | "joint_entropy"
         | "h_xy"
+        | "joint_entropy_bits"
+        | "h_xy_bits"
+        | "joint_entropy_rate_per_bit"
+        | "h_xy_rate_per_bit"
         | "id"
+        | "id_bits"
+        | "intrinsic_dependence_bits"
         | "ned"
+        | "ned_bits"
+        | "ned_cons_bits"
+        | "ned_rate_per_bit"
+        | "ned_cons_rate_per_bit"
         | "nte"
+        | "nte_bits"
+        | "nte_rate_per_bit"
         | "rt"
         | "resistance"
+        | "rt_bits"
+        | "resistance_bits"
+        | "rt_per_bit"
+        | "resistance_per_bit"
         | "kl"
         | "kl_divergence"
+        | "kl_bits"
+        | "kl_divergence_bits"
         | "js"
         | "js_divergence"
+        | "js_bits"
+        | "js_divergence_bits"
         | "tvd"
-        | "nhd" => print_metrics_help(),
+        | "tvd_bits"
+        | "nhd"
+        | "nhd_bits" => print_metrics_help(),
         "backends" | "backend" | "rate-backend" | "compression-backend" => print_backends_help(),
         "compression" | "compress" | "decompress" | "ncd" | "ncd_sym" | "ncd_cons"
         | "ncd_sym_cons" => print_compression_help(),
@@ -142,8 +182,13 @@ Usage:
 
 Single-file metrics:
   h, entropy             Empirical order-0 byte entropy unless a rate backend is selected
-  h_rate, entropy_rate   Algorithmic entropy rate via active RateBackend
-  id                     Intrinsic dependence from empirical entropy and entropy rate
+  h_bits, entropy_bits   Empirical order-0 pooled-bit entropy (alphabet {{0,1}})
+  h_rate, entropy_rate   Algorithmic entropy rate via active RateBackend (bits/byte)
+  h_rate_per_bit         Algorithmic entropy rate in bits/bit (= h_rate / 8)
+  biased_entropy_rate_per_bit
+                         Biased/plugin entropy rate in bits/bit
+  id                     Intrinsic dependence `(H0_bytes - H_rate_bytes) / H0_bytes`
+  id_bits                Bitwise ID `(H0_bits - H_rate_per_bit) / H0_bits` (not id/8)
 
 Two-file metrics:
   mi, mutual_info        Mutual information
@@ -154,6 +199,12 @@ Two-file metrics:
   nte                    Normalized transform effort
   rt, resistance         Resistance to transformation
   kl, js, tvd, nhd       Empirical byte-distribution divergences/distances
+  mi_bits, xe_bits, ...  Empirical bitwise counterparts (binary alphabet)
+  js_bits, kl_bits, tvd_bits, nhd_bits, ned_bits, nte_bits, rt_bits
+  mi_rate_per_bit, xe_rate_per_bit, ce_rate_per_bit, joint_entropy_rate_per_bit
+                         Algorithmic rates in bits/bit (= corresponding *_rate_bytes / 8)
+  ned_rate_per_bit, ned_cons_rate_per_bit, nte_rate_per_bit, rt_per_bit
+                         Scale-invariant aliases (= corresponding *_bytes values)
 
 Backend selection:
   Add --rate-backend, --rate-backend-json, or --expert-spec to use the
@@ -161,8 +212,12 @@ Backend selection:
 
 Examples:
   infotheory h README.md
+  infotheory h_bits README.md
   infotheory h_rate README.md --rate-backend fac-ctw --method 32 --msb-first
+  infotheory h_rate_per_bit README.md --rate-backend ctw --method 16
   infotheory mi a.bin b.bin --rate-backend ctw --method 16
+  infotheory mi_rate_per_bit a.bin b.bin --rate-backend ctw --method 16
+  infotheory js_bits a.bin b.bin
 "#
     );
 }

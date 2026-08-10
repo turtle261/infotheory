@@ -37,6 +37,7 @@ use certificates::validate_complete_finite_reward_interval;
 use certificates::{parse_finite_reward_map, project_observation_output};
 mod config;
 mod eval;
+mod feature_set;
 mod planner_bridge;
 mod report;
 use crate::aixi::common::max_nonnegative_reward_for_bits;
@@ -52,9 +53,7 @@ pub use config::{
     AnnealerKernelProfile, PeakMemoryMode, TimingCertificationTier, TuneCommandRequest,
     TuneExecutionConfig, TuneTheoremConfig, parse_tune_command_args,
 };
-use config::{
-    annealer_kernel_profile_name, compiled_feature_set, peak_memory_mode_name, timing_tier_name,
-};
+use config::{annealer_kernel_profile_name, peak_memory_mode_name, timing_tier_name};
 #[cfg(test)]
 use eval::evaluate_candidate_causal_loss;
 pub use eval::run_tuner_eval_worker_from_env;
@@ -62,10 +61,11 @@ use eval::{
     ResolvedEvaluatorRuntimeProfile, cache_key_for_candidate, evaluate_candidate,
     resolve_evaluator_runtime_profile, timeout_eval_result,
 };
+use feature_set::compiled_feature_set;
 #[cfg(test)]
 use planner_bridge::{
-    TunerRawObservation, compile_tuner_planner_run_spec, encode_tuner_planner_percept,
-    merge_warmstart_trace_deterministic, planner_controller_contract,
+    TunerRawObservation, compile_planner_mutation_actions, compile_tuner_planner_run_spec,
+    encode_tuner_planner_percept, merge_warmstart_trace_deterministic, planner_controller_contract,
     validate_theorem_planner_mutation_domain,
 };
 use planner_bridge::{

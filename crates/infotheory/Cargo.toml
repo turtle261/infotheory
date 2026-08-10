@@ -37,6 +37,7 @@ capability-statistical = [
     "backend-rosa",
     "backend-ctw",
     "backend-match",
+    "backend-context",
     "backend-ppmd",
     "backend-sequitur",
     "backend-mixture",
@@ -44,6 +45,7 @@ capability-statistical = [
     "backend-calibrated",
 ]
 capability-neural = [
+    "backend-bit-reservoir",
     "backend-mamba",
     "backend-rwkv",
 ]
@@ -62,11 +64,13 @@ all-backends = ["capability-default"]
 backend-rosa = []
 backend-ctw = []
 backend-match = []
+backend-context = []
 backend-ppmd = []
 backend-sequitur = []
 backend-mixture = []
 backend-particle = []
 backend-calibrated = []
+backend-bit-reservoir = []
 backend-mamba = []
 backend-rwkv = []
 backend-zpaq = ["dep:zpaq_rs"]

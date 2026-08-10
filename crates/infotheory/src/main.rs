@@ -1382,10 +1382,60 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        "entropy_bits" | "h_bits" => {
+            let f1 = file1.unwrap_or_exit("Error: 'h_bits' requires a file");
+            let data = read_file(&f1);
+            println!("{}", empirical_entropy_bits(&data));
+        }
+        "entropy_rate_per_bit" | "h_rate_per_bit" => {
+            let f1 = file1.unwrap_or_exit("Error: 'h_rate_per_bit' requires a file");
+            let data = read_file(&f1);
+            println!(
+                "{}",
+                cli_unwrap(try_entropy_rate_per_bit(&data), "try_entropy_rate_per_bit",)
+            );
+            if let Err(e) = maybe_export_online_model(model_export_path.as_deref(), &ctx, &[&data])
+            {
+                eprintln!("Error exporting online model: {e}");
+                std::process::exit(1);
+            }
+        }
+        "biased_entropy_rate_per_bit" => {
+            let f1 = file1.unwrap_or_exit("Error: 'biased_entropy_rate_per_bit' requires a file");
+            let data = read_file(&f1);
+            println!(
+                "{}",
+                cli_unwrap(
+                    try_biased_entropy_rate_per_bit(&data),
+                    "try_biased_entropy_rate_per_bit",
+                )
+            );
+            if let Err(e) = maybe_export_online_model(model_export_path.as_deref(), &ctx, &[&data])
+            {
+                eprintln!("Error exporting online model: {e}");
+                std::process::exit(1);
+            }
+        }
         "id" => {
             let f1 = file1.unwrap_or_exit("Error: 'id' requires a file");
             let data = read_file(&f1);
             println!("{:.6}", intrinsic_dependence_bytes(&data));
+            if let Err(e) = maybe_export_online_model(model_export_path.as_deref(), &ctx, &[&data])
+            {
+                eprintln!("Error exporting online model: {e}");
+                std::process::exit(1);
+            }
+        }
+        "id_bits" | "intrinsic_dependence_bits" => {
+            let f1 = file1.unwrap_or_exit("Error: 'id_bits' requires a file");
+            let data = read_file(&f1);
+            println!(
+                "{:.6}",
+                cli_unwrap(
+                    try_intrinsic_dependence_bits(&data),
+                    "try_intrinsic_dependence_bits",
+                )
+            );
             if let Err(e) = maybe_export_online_model(model_export_path.as_deref(), &ctx, &[&data])
             {
                 eprintln!("Error exporting online model: {e}");
@@ -1403,14 +1453,18 @@ fn main() {
             let res = match other {
                 "ned" if rate_backend_specified => ned_bytes(&b1, &b2),
                 "ned" => empirical_ned_bytes(&b1, &b2),
+                "ned_bits" => empirical_ned_bits(&b1, &b2),
                 "ned_cons" if rate_backend_specified => ned_cons_bytes(&b1, &b2),
                 "ned_cons" => empirical_ned_cons_bytes(&b1, &b2),
+                "ned_cons_bits" => empirical_ned_cons_bits(&b1, &b2),
                 "nte" if rate_backend_specified => nte_bytes(&b1, &b2),
                 "nte" => empirical_nte_bytes(&b1, &b2),
+                "nte_bits" => empirical_nte_bits(&b1, &b2),
                 "mi" | "mutual_info" if rate_backend_specified => {
                     mutual_information_bytes(&b1, &b2)
                 }
                 "mi" | "mutual_info" => empirical_mutual_information_bytes(&b1, &b2),
+                "mi_bits" => empirical_mutual_information_bits(&b1, &b2),
                 "ce" | "conditional_entropy" if rate_backend_specified => {
                     conditional_entropy_bytes(&b1, &b2)
                 }
@@ -1421,18 +1475,57 @@ fn main() {
                 }
                 "xe" | "cross_entropy" if rate_backend_specified => cross_entropy_bytes(&b1, &b2),
                 "xe" | "cross_entropy" => empirical_cross_entropy_bytes(&b1, &b2),
+                "xe_bits" | "cross_entropy_bits" => empirical_cross_entropy_bits(&b1, &b2),
                 "joint_entropy" | "h_xy" if rate_backend_specified => {
                     joint_entropy_rate_bytes(&b1, &b2)
                 }
                 "joint_entropy" | "h_xy" => empirical_joint_entropy_bytes(&b1, &b2),
+                "joint_entropy_bits" | "h_xy_bits" => empirical_joint_entropy_bits(&b1, &b2),
                 "rt" | "resistance" if rate_backend_specified => {
                     resistance_to_transformation_bytes(&b1, &b2)
                 }
                 "rt" | "resistance" => empirical_resistance_to_transformation_bytes(&b1, &b2),
+                "rt_bits" | "resistance_bits" => {
+                    empirical_resistance_to_transformation_bits(&b1, &b2)
+                }
                 "tvd" => tvd_paths(&f1, &f2),
+                "tvd_bits" => tvd_bits(&b1, &b2),
                 "nhd" => nhd_paths(&f1, &f2),
+                "nhd_bits" => nhd_bits(&b1, &b2),
                 "kl" | "kl_divergence" => kl_divergence_paths(&f1, &f2),
+                "kl_bits" | "kl_divergence_bits" => d_kl_bits(&b1, &b2),
                 "js" | "js_divergence" => js_divergence_paths(&f1, &f2),
+                "js_bits" | "js_divergence_bits" => js_div_bits(&b1, &b2),
+                "joint_entropy_rate_per_bit" | "h_xy_rate_per_bit" => cli_unwrap(
+                    try_joint_entropy_rate_per_bit(&b1, &b2),
+                    "try_joint_entropy_rate_per_bit",
+                ),
+                "mi_rate_per_bit" | "mutual_information_rate_per_bit" => cli_unwrap(
+                    try_mutual_information_rate_per_bit(&b1, &b2),
+                    "try_mutual_information_rate_per_bit",
+                ),
+                "xe_rate_per_bit" | "cross_entropy_rate_per_bit" => cli_unwrap(
+                    try_cross_entropy_rate_per_bit(&b1, &b2),
+                    "try_cross_entropy_rate_per_bit",
+                ),
+                "ce_rate_per_bit" | "conditional_entropy_rate_per_bit" => cli_unwrap(
+                    try_conditional_entropy_rate_per_bit(&b1, &b2),
+                    "try_conditional_entropy_rate_per_bit",
+                ),
+                "ned_rate_per_bit" => {
+                    cli_unwrap(try_ned_rate_per_bit(&b1, &b2), "try_ned_rate_per_bit")
+                }
+                "ned_cons_rate_per_bit" => cli_unwrap(
+                    try_ned_cons_rate_per_bit(&b1, &b2),
+                    "try_ned_cons_rate_per_bit",
+                ),
+                "nte_rate_per_bit" => {
+                    cli_unwrap(try_nte_rate_per_bit(&b1, &b2), "try_nte_rate_per_bit")
+                }
+                "rt_per_bit" | "resistance_per_bit" => cli_unwrap(
+                    try_resistance_to_transformation_per_bit(&b1, &b2),
+                    "try_resistance_to_transformation_per_bit",
+                ),
                 _ => {
                     eprintln!("Unknown primitive: {}", other);
                     print_usage();
@@ -2377,6 +2470,10 @@ mod tests {
         assert_eq!(
             parse_mixture_kind("neural").expect("neural kind"),
             MixtureKind::Neural
+        );
+        assert_eq!(
+            parse_mixture_kind("logistic").expect("logistic kind"),
+            MixtureKind::Logistic
         );
         assert!(parse_mixture_kind("bayes-mix").is_err());
         assert!(parse_mixture_kind("switch").is_err());

@@ -203,6 +203,24 @@ impl PpmdModel {
         &self.cdf
     }
 
+    // This intentionally still routes through the dense `ensure_pdf_inner`
+    // path rather than the sparse, distinct-symbol-only `SparseQueryState`
+    // walk (below, test-only). The sparse walk is bit-identical (see
+    // `exact_symbol_queries_match_dense_pdf`) and is asymptotically cheaper
+    // per context order when few distinct symbols have been observed, but
+    // measured standalone on 10 MB of enwik7 (`h_rate`, CPU-pinned,
+    // `RAYON_NUM_THREADS=1`, order=12/256 MiB) it was ~18% *slower*
+    // end-to-end (18.3s -> 21.6s user time) at identical bpb. Real text
+    // saturates the order-0 context's distinct-symbol set to a large
+    // fraction of the 256-byte alphabet almost immediately (enwik mixes
+    // ASCII markup with multi-byte UTF-8), so `SparseQueryState`'s
+    // touched-set is not actually small in the corpora this project cares
+    // about; its branchy, index-gathered `touched_symbols` walk then loses
+    // to the dense path's plain, auto-vectorizable `for p in
+    // lower.iter_mut() { *p *= escape }` sweep. Keep the dense path as the
+    // real `symbol_prob` implementation; do not promote `SparseQueryState`
+    // to production without re-measuring on realistic (not synthetic
+    // low-alphabet) input.
     pub(crate) fn symbol_prob(&mut self, symbol: u8) -> f64 {
         self.ensure_pdf_inner(false);
         self.pdf[symbol as usize]

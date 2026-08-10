@@ -14,8 +14,12 @@ use anyhow::{Result, bail};
 use crate::api::{MixtureKind, MixtureScheduleMode};
 #[cfg(test)]
 use crate::api::{MixtureSpec, RateBackend};
+#[cfg(feature = "backend-bit-reservoir")]
+use crate::backends::bit_reservoir::{BitReservoirModel, BitReservoirPrediction};
 #[cfg(feature = "backend-calibrated")]
 use crate::backends::calibration::CalibratorCore;
+#[cfg(feature = "backend-context")]
+use crate::backends::context_counter::{OrderNGramModel, WordContextModel};
 #[cfg(feature = "backend-ctw")]
 use crate::backends::ctw::{ContextTree, FacContextTree, ctw_symbol_bit_msb};
 #[cfg(feature = "backend-match")]
@@ -28,13 +32,14 @@ use crate::backends::rosaplus::RosaPlus;
 use crate::backends::sequitur::SequiturModel;
 #[cfg(feature = "backend-match")]
 use crate::backends::sparse_match::SparseMatchModel;
-use crate::backends::text_context::TextContextAnalyzer;
+use crate::backends::text_context::{TextContextAnalyzer, bucket_repeat_len, classify_byte};
 #[cfg(feature = "backend-zpaq")]
 use crate::backends::zpaq_rate::ZpaqRateModel;
 #[cfg(all(test, feature = "all-backends"))]
 use crate::byte_prefix::zeroed_prefix_cdf;
 use crate::byte_prefix::{
-    BytePrefixCdf, MsbPrefixRange, fill_prefix_cdf_from_pdf, normalize_pdf, zeroed_prefix_cdf_box,
+    BytePrefixCdf, MsbPrefixRange, advanced_prefix_code, fill_prefix_cdf_from_pdf, normalize_pdf,
+    zeroed_prefix_cdf_box,
 };
 use crate::coders::{
     ANS_TOTAL, ArithmeticDecoder, ArithmeticEncoder, BlockedRansDecoder, BlockedRansEncoder,
@@ -46,11 +51,15 @@ use crate::mixture::{
     DEFAULT_MIN_PROB, convex_step_size_for_update, project_simplex_with_scratch,
     switching_alpha_for_update,
 };
-use crate::neural_mix::NeuralMixCore;
+use crate::neural_mix::LogisticMatchState;
 #[cfg(feature = "backend-rwkv")]
 use crate::rwkvzip;
 use crate::spec::CompiledRateBackend;
 use rayon::{ThreadPool, prelude::*};
+
+mod mixture_predictor;
+
+pub(crate) use mixture_predictor::MixturePredictor;
 
 const FRAMED_MAGIC: u32 = 0x4354_4946; // "FITC"
 const FRAMED_VERSION: u8 = 1;
@@ -660,14 +669,6 @@ impl RwkvPredictor {
     }
 }
 
-#[derive(Clone)]
-struct MixExpert {
-    predictor: Box<RatePdfPredictor>,
-    log_weight: f64,
-    log_prior: f64,
-    cum_log_loss: f64,
-}
-
 #[derive(Clone, Debug)]
 pub(crate) enum PredictorBitwiseStepState {
     NativeRecursive,
@@ -702,6 +703,10 @@ impl PredictorBitwiseStepState {
             return Ok(());
         }
 
+        self.prepare_pdf_prefix(predictor)
+    }
+
+    fn prepare_pdf_prefix(&mut self, predictor: &mut RatePdfPredictor) -> Result<()> {
         let mut cdf = match std::mem::take(self) {
             Self::PdfPrefix { cdf, .. } => cdf,
             _ => zeroed_prefix_cdf_box(),
@@ -743,6 +748,29 @@ impl PredictorBitwiseStepState {
         }
     }
 
+    fn observe_known_bit_msb(
+        &mut self,
+        predictor: &mut RatePdfPredictor,
+        bit_idx: usize,
+        bit: bool,
+    ) -> Result<f64> {
+        match self {
+            Self::NativeRecursive => predictor.native_recursive_observe_known_bit_msb(bit_idx, bit),
+            Self::CachedCdf { range } => {
+                let p1 = predictor
+                    .cached_cdf_bit_prob_one_msb(*range)
+                    .expect("CachedCdf state invariant violated: missing cached CDF entry");
+                range.observe(bit);
+                Ok(p1)
+            }
+            Self::PdfPrefix { cdf, range } => {
+                let p1 = range.prob_one(cdf.as_ref(), PDF_MIN);
+                range.observe(bit);
+                Ok(p1)
+            }
+        }
+    }
+
     fn finish_symbol(&mut self, predictor: &mut RatePdfPredictor, symbol: u8) -> Result<()> {
         match self {
             Self::NativeRecursive => predictor.finish_native_recursive_bitwise_byte_step(symbol),
@@ -774,675 +802,12 @@ pub(crate) struct AcLogLossRootSnapshot {
     pub(crate) root_top2_weight: f64,
 }
 
-#[derive(Clone)]
-pub(crate) struct MixturePredictor {
-    kind: MixtureKind,
-    schedule: MixtureScheduleMode,
-    alpha: f64,
-    decay: f64,
-    experts: Vec<MixExpert>,
-    prior_weights: Vec<f64>,
-    neural: NeuralMixCore,
-    analyzer: TextContextAnalyzer,
-    bitwise_expert_states: Vec<PredictorBitwiseStepState>,
-    // Reused per-expert observation scratch: symbol paths store log p(symbol),
-    // while bitwise AC temporarily stages p(bit = 1) before collapsing back to
-    // the symbol log-probability at byte completion.
-    expert_observation_scratch: Vec<f64>,
-    scratch: Vec<f64>,
-    scratch2: Vec<f64>,
-    projection_scratch: Vec<f64>,
-    pdf: Vec<f64>,
-    valid: bool,
-    switch_updates: u64,
-    convex_updates: u64,
-}
-
-impl MixturePredictor {
-    pub(crate) fn new_from_compiled(backend: &CompiledRateBackend) -> Result<Self> {
-        let crate::spec::core::RateBackendPlan::Mixture {
-            kind,
-            schedule,
-            alpha,
-            decay,
-            experts: plan_experts,
-            ..
-        } = backend.plan()
-        else {
-            bail!("compiled backend is not a mixture backend");
-        };
-        let mut experts = Vec::with_capacity(plan_experts.len());
-        for expert_plan in plan_experts.iter() {
-            let compiled =
-                crate::spec::core::compiled_rate_backend_from_plan(expert_plan.backend.clone())
-                    .map_err(anyhow::Error::msg)?;
-            experts.push(MixExpert {
-                predictor: Box::new(crate::runtime::build_rate_pdf_predictor(&compiled)?),
-                log_weight: expert_plan.log_prior,
-                log_prior: expert_plan.log_prior,
-                cum_log_loss: 0.0,
-            });
-        }
-        let m = logsumexp_expert_weights(&experts);
-        for e in &mut experts {
-            e.log_weight -= m;
-        }
-
-        let mut prior_weights = vec![0.0; experts.len()];
-        normalized_mix_expert_prior_weights(&experts, &mut prior_weights);
-        let mut neural_prior_weights = prior_weights.clone();
-        for weight in &mut neural_prior_weights {
-            *weight = weight.clamp(PDF_MIN, 1.0 - PDF_MIN);
-        }
-
-        let base_lr = alpha.abs().clamp(1e-6, 1.0);
-        let effective_lr = (base_lr * 25.0).clamp(1e-6, 1.0);
-        let analyzer = TextContextAnalyzer::new();
-        let mut neural = NeuralMixCore::new(
-            experts.len(),
-            &neural_prior_weights,
-            effective_lr * 0.5,
-            effective_lr,
-            1e-5,
-        );
-        neural.set_context_state(analyzer.state());
-        Ok(Self {
-            kind: *kind,
-            schedule: *schedule,
-            alpha: *alpha,
-            decay: decay.unwrap_or(1.0).clamp(0.0, 1.0),
-            experts,
-            prior_weights,
-            neural,
-            analyzer,
-            bitwise_expert_states: Vec::new(),
-            expert_observation_scratch: vec![0.0; plan_experts.len()],
-            scratch: Vec::new(),
-            scratch2: Vec::new(),
-            projection_scratch: Vec::new(),
-            pdf: vec![0.0; 256],
-            valid: false,
-            switch_updates: 0,
-            convex_updates: 0,
-        })
-    }
-
-    fn best_expert_index(&self) -> Option<usize> {
-        let mut best_idx = None;
-        let mut best_loss = f64::INFINITY;
-        for (index, expert) in self.experts.iter().enumerate() {
-            if expert.cum_log_loss < best_loss {
-                best_loss = expert.cum_log_loss;
-                best_idx = Some(index);
-            }
-        }
-        best_idx
-    }
-
-    fn predictive_weights(&mut self) -> Vec<f64> {
-        if self.experts.is_empty() {
-            return Vec::new();
-        }
-
-        match self.kind {
-            MixtureKind::Neural => {
-                if self.experts.len() == 1 {
-                    return vec![1.0];
-                }
-                self.neural.set_context_state(self.analyzer.state());
-                self.neural.evaluate_expert_weights();
-                let mut weights = self.neural.expert_weights().to_vec();
-                normalize_simplex_weights(&mut weights);
-                weights
-            }
-            MixtureKind::Mdl => {
-                let mut weights = vec![0.0; self.experts.len()];
-                if let Some(best_idx) = self.best_expert_index() {
-                    weights[best_idx] = 1.0;
-                }
-                weights
-            }
-            MixtureKind::FadingBayes => {
-                let max_log = self
-                    .experts
-                    .iter()
-                    .map(|expert| self.decay * expert.log_weight)
-                    .fold(f64::NEG_INFINITY, f64::max);
-                let mut weights = self
-                    .experts
-                    .iter()
-                    .map(|expert| {
-                        if max_log.is_finite() {
-                            (self.decay * expert.log_weight - max_log).exp()
-                        } else {
-                            0.0
-                        }
-                    })
-                    .collect::<Vec<_>>();
-                normalize_simplex_weights(&mut weights);
-                weights
-            }
-            MixtureKind::Convex => {
-                let mut weights = self
-                    .experts
-                    .iter()
-                    .map(|expert| expert.log_weight.exp())
-                    .collect::<Vec<_>>();
-                normalize_simplex_weights(&mut weights);
-                weights
-            }
-            MixtureKind::Bayes | MixtureKind::Switching => {
-                let max_log = self
-                    .experts
-                    .iter()
-                    .map(|expert| expert.log_weight)
-                    .fold(f64::NEG_INFINITY, f64::max);
-                let mut weights = self
-                    .experts
-                    .iter()
-                    .map(|expert| {
-                        if max_log.is_finite() {
-                            (expert.log_weight - max_log).exp()
-                        } else {
-                            0.0
-                        }
-                    })
-                    .collect::<Vec<_>>();
-                normalize_simplex_weights(&mut weights);
-                weights
-            }
-        }
-    }
-
-    fn ensure_pdf(&mut self) -> Result<&[f64]> {
-        if self.valid {
-            return Ok(&self.pdf);
-        }
-        let weights = self.predictive_weights();
-        self.pdf.fill(0.0);
-        for (index, expert) in self.experts.iter_mut().enumerate() {
-            let weight = weights.get(index).copied().unwrap_or(0.0);
-            if weight <= 0.0 {
-                continue;
-            }
-            let epdf = expert.predictor.pdf_next()?;
-            for (slot, &p) in self.pdf.iter_mut().zip(epdf.iter()) {
-                *slot += weight * p;
-            }
-        }
-
-        normalize_pdf(&mut self.pdf, PDF_MIN);
-        self.valid = true;
-        Ok(&self.pdf)
-    }
-
-    fn begin_stream(&mut self, total_len: usize) -> Result<()> {
-        for expert in &mut self.experts {
-            match &mut *expert.predictor {
-                // Direct CTW benefits from pre-reserving, but inside mixtures that extra
-                // headroom can dominate peak RSS without a proportional runtime gain.
-                #[cfg(feature = "backend-ctw")]
-                RatePdfPredictor::Ctw(_) | RatePdfPredictor::FacCtw(_) => {}
-                _ => expert.predictor.begin_stream(total_len)?,
-            }
-        }
-        Ok(())
-    }
-
-    fn diagnostic_collect_children(
-        &mut self,
-        symbol: u8,
-        weights: &[f64],
-        effective_prefix: f64,
-        pool: Option<&ThreadPool>,
-    ) -> Result<Vec<AcLogLossSubtreeSnapshot>> {
-        let use_parallel = pool.is_some() && self.experts.len() >= DIAGNOSTIC_PARALLEL_THRESHOLD;
-        if use_parallel {
-            let pool = pool.expect("checked is_some");
-            pool.install(|| {
-                self.experts
-                    .par_iter_mut()
-                    .enumerate()
-                    .map(|(index, expert)| {
-                        let local_weight = weights.get(index).copied().unwrap_or(0.0);
-                        let effective_weight = effective_prefix * local_weight;
-                        expert.predictor.diagnostic_snapshot_subtree(
-                            symbol,
-                            local_weight,
-                            effective_weight,
-                            None,
-                        )
-                    })
-                    .collect()
-            })
-        } else {
-            let mut children = Vec::with_capacity(self.experts.len());
-            for (index, expert) in self.experts.iter_mut().enumerate() {
-                let local_weight = weights.get(index).copied().unwrap_or(0.0);
-                let effective_weight = effective_prefix * local_weight;
-                children.push(expert.predictor.diagnostic_snapshot_subtree(
-                    symbol,
-                    local_weight,
-                    effective_weight,
-                    pool,
-                )?);
-            }
-            Ok(children)
-        }
-    }
-
-    fn diagnostic_subtree_snapshot(
-        &mut self,
-        symbol: u8,
-        local_weight: f64,
-        effective_weight: f64,
-        pool: Option<&ThreadPool>,
-    ) -> Result<AcLogLossSubtreeSnapshot> {
-        let weights = self.predictive_weights();
-        let children =
-            self.diagnostic_collect_children(symbol, &weights, effective_weight, pool)?;
-        let mix_prob = children
-            .iter()
-            .enumerate()
-            .map(|(index, child)| weights.get(index).copied().unwrap_or(0.0) * child.prob)
-            .sum::<f64>()
-            .max(PDF_MIN);
-        let total_rows = 1 + children.iter().map(|child| child.rows.len()).sum::<usize>();
-        let mut rows = Vec::with_capacity(total_rows);
-        rows.push(AcLogLossNodeValue {
-            prob: mix_prob,
-            local_weight,
-            effective_weight,
-        });
-        for child in children {
-            rows.extend(child.rows);
-        }
-        Ok(AcLogLossSubtreeSnapshot {
-            prob: mix_prob,
-            rows,
-        })
-    }
-
-    fn diagnostic_root_snapshot(
-        &mut self,
-        symbol: u8,
-        pool: Option<&ThreadPool>,
-        out: &mut Vec<AcLogLossNodeValue>,
-    ) -> Result<AcLogLossRootSnapshot> {
-        let weights = self.predictive_weights();
-        let children = self.diagnostic_collect_children(symbol, &weights, 1.0, pool)?;
-        out.clear();
-        out.reserve(children.iter().map(|child| child.rows.len()).sum::<usize>());
-        for child in &children {
-            out.extend_from_slice(&child.rows);
-        }
-
-        let mix_prob = children
-            .iter()
-            .enumerate()
-            .map(|(index, child)| weights.get(index).copied().unwrap_or(0.0) * child.prob)
-            .sum::<f64>()
-            .max(PDF_MIN);
-
-        let mut top1 = None;
-        let mut top2 = None;
-        for (index, &weight) in weights.iter().enumerate() {
-            match top1 {
-                None => top1 = Some((index, weight)),
-                Some((best_idx, best_weight)) if weight > best_weight => {
-                    top2 = Some((best_idx, best_weight));
-                    top1 = Some((index, weight));
-                }
-                _ => match top2 {
-                    None => top2 = Some((index, weight)),
-                    Some((_, second_weight)) if weight > second_weight => {
-                        top2 = Some((index, weight));
-                    }
-                    _ => {}
-                },
-            }
-        }
-
-        let root_weight_entropy_bits = weights
-            .iter()
-            .copied()
-            .filter(|weight| *weight > 0.0)
-            .map(|weight| -weight * weight.log2())
-            .sum::<f64>();
-
-        Ok(AcLogLossRootSnapshot {
-            mix_prob,
-            root_weight_entropy_bits,
-            root_top1_child_index: top1.map(|(index, _)| index),
-            root_top1_weight: top1.map(|(_, weight)| weight).unwrap_or(0.0),
-            root_top2_child_index: top2.map(|(index, _)| index),
-            root_top2_weight: top2.map(|(_, weight)| weight).unwrap_or(0.0),
-        })
-    }
-
-    fn update(&mut self, symbol: u8) -> Result<()> {
-        let _ = self.ensure_pdf()?;
-
-        match self.kind {
-            MixtureKind::Bayes => {
-                let n = self.experts.len();
-                self.scratch.resize(n, 0.0);
-                self.scratch2.resize(n, 0.0);
-                for (i, e) in self.experts.iter_mut().enumerate() {
-                    let p = e.predictor.pdf_next()?[symbol as usize].max(PDF_MIN);
-                    let lp = p.ln();
-                    self.scratch[i] = lp;
-                    self.scratch2[i] = e.log_weight + lp;
-                }
-                let log_mix = logsumexp_slice(&self.scratch2[..n]);
-                for (i, e) in self.experts.iter_mut().enumerate() {
-                    e.log_weight = e.log_weight + self.scratch[i] - log_mix;
-                    e.cum_log_loss -= self.scratch[i];
-                    e.predictor.update(symbol)?;
-                }
-            }
-            MixtureKind::FadingBayes => {
-                let n = self.experts.len();
-                self.scratch.resize(n, 0.0);
-                self.scratch2.resize(n, 0.0);
-                for (i, e) in self.experts.iter_mut().enumerate() {
-                    let p = e.predictor.pdf_next()?[symbol as usize].max(PDF_MIN);
-                    let lp = p.ln();
-                    self.scratch[i] = lp;
-                    self.scratch2[i] = e.log_weight + lp;
-                }
-                for (i, e) in self.experts.iter_mut().enumerate() {
-                    self.scratch2[i] = self.decay * e.log_weight + self.scratch[i];
-                }
-                let log_mix = logsumexp_slice(&self.scratch2[..n]);
-                for (i, e) in self.experts.iter_mut().enumerate() {
-                    e.log_weight = self.decay * e.log_weight + self.scratch[i] - log_mix;
-                    e.cum_log_loss -= self.scratch[i];
-                    e.predictor.update(symbol)?;
-                }
-            }
-            MixtureKind::Switching => {
-                let n = self.experts.len();
-                self.scratch.resize(n, 0.0);
-                self.scratch2.resize(n, 0.0);
-                for (i, e) in self.experts.iter_mut().enumerate() {
-                    let p = e.predictor.pdf_next()?[symbol as usize].max(PDF_MIN);
-                    let lp = p.ln();
-                    self.scratch[i] = lp;
-                    self.scratch2[i] = e.log_weight + lp;
-                }
-                let log_mix = logsumexp_slice(&self.scratch2[..n]);
-                for (i, e) in self.experts.iter_mut().enumerate() {
-                    self.scratch2[i] = (self.scratch2[i] - log_mix).exp();
-                    e.cum_log_loss -= self.scratch[i];
-                    e.predictor.update(symbol)?;
-                }
-                let alpha =
-                    switching_alpha_for_update(self.schedule, self.alpha, self.switch_updates);
-                self.switch_updates = self.switch_updates.saturating_add(1);
-                apply_switching_weights(
-                    &mut self.experts,
-                    &self.prior_weights[..n],
-                    alpha,
-                    &mut self.scratch2[..n],
-                    &mut self.scratch[..n],
-                );
-            }
-            MixtureKind::Convex => {
-                let n = self.experts.len();
-                self.scratch.resize(n, 0.0);
-                self.scratch2.resize(n, 0.0);
-                for (i, e) in self.experts.iter_mut().enumerate() {
-                    let p = e.predictor.pdf_next()?[symbol as usize].max(PDF_MIN);
-                    let lp = p.ln();
-                    self.scratch[i] = lp;
-                    self.scratch2[i] = e.log_weight.exp();
-                    e.cum_log_loss -= lp;
-                    e.predictor.update(symbol)?;
-                }
-                let mix_prob = self
-                    .scratch
-                    .iter()
-                    .zip(self.scratch2.iter())
-                    .map(|(&lp, &w)| w * lp.exp())
-                    .sum::<f64>()
-                    .max(PDF_MIN);
-                let log_mix = mix_prob.ln();
-                self.convex_updates = self.convex_updates.saturating_add(1);
-                let eta =
-                    convex_step_size_for_update(self.schedule, self.alpha, self.convex_updates);
-                for i in 0..n {
-                    let grad = -(self.scratch[i] - log_mix).exp();
-                    self.scratch2[i] -= eta * grad;
-                }
-                project_simplex_with_scratch(&mut self.scratch2[..n], &mut self.projection_scratch);
-                for i in 0..n {
-                    self.experts[i].log_weight = self.scratch2[i].max(PDF_MIN).ln();
-                }
-            }
-            MixtureKind::Mdl => {
-                let n = self.experts.len();
-                self.scratch.resize(n, 0.0);
-                for (i, e) in self.experts.iter_mut().enumerate() {
-                    let p = e.predictor.pdf_next()?[symbol as usize].max(PDF_MIN);
-                    let lp = p.ln();
-                    self.scratch[i] = lp;
-                }
-                for (i, e) in self.experts.iter_mut().enumerate() {
-                    e.cum_log_loss -= self.scratch[i];
-                    e.predictor.update(symbol)?;
-                }
-            }
-            MixtureKind::Neural => {
-                let y = symbol as usize;
-                if self.experts.len() == 1 {
-                    let lp = self.experts[0].predictor.pdf_next()?[y].max(PDF_MIN).ln();
-                    self.experts[0].cum_log_loss -= lp;
-                    self.experts[0].predictor.update(symbol)?;
-                    self.analyzer.update(symbol);
-                    self.neural.set_context_state(self.analyzer.state());
-                    self.valid = false;
-                    return Ok(());
-                }
-                let n = self.experts.len();
-                self.neural.set_context_state(self.analyzer.state());
-                self.expert_observation_scratch.resize(n, 0.0);
-                for i in 0..n {
-                    let p = self.experts[i].predictor.pdf_next()?[y].max(PDF_MIN);
-                    let lp = p.ln();
-                    self.expert_observation_scratch[i] = lp;
-                    self.experts[i].cum_log_loss -= lp;
-                }
-                self.neural
-                    .evaluate_symbol(&self.expert_observation_scratch, PDF_MIN);
-                self.neural
-                    .update_weights_symbol(&self.expert_observation_scratch, PDF_MIN);
-                for e in &mut self.experts {
-                    e.predictor.update(symbol)?;
-                }
-                self.analyzer.update(symbol);
-                self.neural.set_context_state(self.analyzer.state());
-            }
-        }
-
-        self.valid = false;
-        Ok(())
-    }
-
-    fn finish_stream(&mut self) -> Result<()> {
-        for expert in &mut self.experts {
-            expert.predictor.finish_stream()?;
-        }
-        Ok(())
-    }
-
-    #[inline]
-    fn has_recursive_native_bitwise_expert(&self) -> bool {
-        self.experts
-            .iter()
-            .any(|expert| expert.predictor.has_recursive_native_bitwise_path())
-    }
-
-    fn begin_bitwise_byte_step(&mut self) -> Result<bool> {
-        if !self.has_recursive_native_bitwise_expert() {
-            return Ok(false);
-        }
-
-        let n = self.experts.len();
-        self.scratch.resize(n, 0.0);
-        match self.kind {
-            MixtureKind::Neural if n > 1 => {
-                self.neural.set_context_state(self.analyzer.state());
-                self.neural.evaluate_expert_weights();
-                self.scratch.copy_from_slice(self.neural.expert_weights());
-            }
-            _ => {
-                let weights = self.predictive_weights();
-                self.scratch.copy_from_slice(&weights);
-            }
-        }
-        self.scratch2.resize(n, 1.0);
-        self.scratch2.fill(1.0);
-        self.expert_observation_scratch.resize(n, 0.0);
-        self.bitwise_expert_states
-            .resize_with(n, PredictorBitwiseStepState::default);
-        for i in 0..n {
-            self.bitwise_expert_states[i].prepare(&mut self.experts[i].predictor)?;
-        }
-        Ok(true)
-    }
-
-    fn bit_prob_one_msb(&mut self, bit_idx: usize) -> Result<f64> {
-        let mut denom = 0.0;
-        let mut numer1 = 0.0;
-        for i in 0..self.experts.len() {
-            let p1 = self.bitwise_expert_states[i]
-                .bit_prob_one_msb(&mut self.experts[i].predictor, bit_idx)?;
-            self.expert_observation_scratch[i] = p1;
-            let wp = self.scratch[i] * self.scratch2[i];
-            denom += wp;
-            numer1 += wp * p1;
-        }
-        Ok(if denom.is_finite() && denom > 0.0 {
-            (numer1 / denom).clamp(PDF_MIN, 1.0 - PDF_MIN)
-        } else {
-            panic!(
-                "MixturePredictor bit_prob_one_msb: invalid denom (finite>0 violated); \
-                 this is an internal invariant failure in the bitwise mixture state machine"
-            )
-        })
-    }
-
-    fn observe_bit_msb(&mut self, bit_idx: usize, bit: bool) -> Result<()> {
-        for i in 0..self.experts.len() {
-            let p1 = self.expert_observation_scratch[i];
-            let pb = if bit { p1 } else { 1.0 - p1 };
-            self.scratch2[i] = (self.scratch2[i] * pb).max(PDF_MIN);
-            self.bitwise_expert_states[i].observe_bit_msb(
-                &mut self.experts[i].predictor,
-                bit_idx,
-                bit,
-            )?;
-        }
-        Ok(())
-    }
-
-    fn finish_bitwise_symbol(&mut self, symbol: u8) -> Result<()> {
-        let n = self.experts.len();
-        for i in 0..n {
-            let lp = self.scratch2[i].max(PDF_MIN).ln();
-            self.expert_observation_scratch[i] = lp;
-            self.experts[i].cum_log_loss -= lp;
-            self.bitwise_expert_states[i].finish_symbol(&mut self.experts[i].predictor, symbol)?;
-        }
-
-        match self.kind {
-            MixtureKind::Bayes => {
-                for i in 0..n {
-                    self.scratch[i] =
-                        self.experts[i].log_weight + self.expert_observation_scratch[i];
-                }
-                let log_mix = logsumexp_slice(&self.scratch[..n]);
-                for i in 0..n {
-                    self.experts[i].log_weight += self.expert_observation_scratch[i] - log_mix;
-                }
-            }
-            MixtureKind::FadingBayes => {
-                for i in 0..n {
-                    self.scratch[i] = self.decay * self.experts[i].log_weight
-                        + self.expert_observation_scratch[i];
-                }
-                let log_mix = logsumexp_slice(&self.scratch[..n]);
-                for i in 0..n {
-                    self.experts[i].log_weight = self.scratch[i] - log_mix;
-                }
-            }
-            MixtureKind::Switching => {
-                for i in 0..n {
-                    self.scratch[i] =
-                        self.experts[i].log_weight + self.expert_observation_scratch[i];
-                }
-                let log_mix = logsumexp_slice(&self.scratch[..n]);
-                for weight in &mut self.scratch[..n] {
-                    *weight = (*weight - log_mix).exp();
-                }
-                let alpha =
-                    switching_alpha_for_update(self.schedule, self.alpha, self.switch_updates);
-                self.switch_updates = self.switch_updates.saturating_add(1);
-                apply_switching_weights(
-                    &mut self.experts,
-                    &self.prior_weights[..n],
-                    alpha,
-                    &mut self.scratch[..n],
-                    &mut self.scratch2[..n],
-                );
-            }
-            MixtureKind::Convex => {
-                self.scratch.resize(n, 0.0);
-                self.scratch2.resize(n, 0.0);
-                for i in 0..n {
-                    self.scratch2[i] = self.experts[i].log_weight.exp();
-                }
-                let mix_prob = self
-                    .expert_observation_scratch
-                    .iter()
-                    .zip(self.scratch2.iter())
-                    .map(|(&lp, &w)| w * lp.exp())
-                    .sum::<f64>()
-                    .max(PDF_MIN);
-                let log_mix = mix_prob.ln();
-                self.convex_updates = self.convex_updates.saturating_add(1);
-                let eta =
-                    convex_step_size_for_update(self.schedule, self.alpha, self.convex_updates);
-                for i in 0..n {
-                    let grad = -(self.expert_observation_scratch[i] - log_mix).exp();
-                    self.scratch2[i] -= eta * grad;
-                }
-                project_simplex_with_scratch(&mut self.scratch2[..n], &mut self.projection_scratch);
-                for i in 0..n {
-                    self.experts[i].log_weight = self.scratch2[i].max(PDF_MIN).ln();
-                }
-            }
-            MixtureKind::Mdl => {}
-            MixtureKind::Neural => {
-                if n > 1 {
-                    self.neural.set_context_state(self.analyzer.state());
-                    self.neural
-                        .evaluate_symbol(&self.expert_observation_scratch, PDF_MIN);
-                    self.neural
-                        .update_weights_symbol(&self.expert_observation_scratch, PDF_MIN);
-                }
-                self.analyzer.update(symbol);
-                self.neural.set_context_state(self.analyzer.state());
-            }
-        }
-        self.valid = false;
-        Ok(())
-    }
-}
-
 pub(crate) struct DiagnosticRatePredictor {
     inner: RatePdfPredictor,
+    // Reused across the whole diagnostic stream (see `ac_step_bitwise_with_state`
+    // doc comment) so per-byte AC stepping does not pay a fresh scratch
+    // allocation for backends that immediately discard it in `prepare()`.
+    bitwise_scratch: PredictorBitwiseStepState,
 }
 
 impl DiagnosticRatePredictor {
@@ -1455,10 +820,12 @@ impl DiagnosticRatePredictor {
     pub(crate) fn from_compiled(backend: &CompiledRateBackend) -> Result<Self> {
         Ok(Self {
             inner: crate::runtime::build_rate_pdf_predictor(backend)?,
+            bitwise_scratch: PredictorBitwiseStepState::default(),
         })
     }
 
     pub(crate) fn begin_stream(&mut self, total_len: usize) -> Result<()> {
+        self.bitwise_scratch = PredictorBitwiseStepState::default();
         self.inner.begin_stream(total_len)
     }
 
@@ -1491,7 +858,8 @@ impl DiagnosticRatePredictor {
         encoder: &mut ArithmeticEncoder<W>,
         cdf: &mut [u32; 257],
     ) -> Result<()> {
-        self.inner.encode_symbol_ac_step(symbol, encoder, cdf)
+        self.inner
+            .encode_symbol_ac_step(&mut self.bitwise_scratch, symbol, encoder, cdf)
     }
 }
 
@@ -1504,6 +872,10 @@ pub(crate) enum RatePdfPredictor {
     Match { model: MatchModel },
     #[cfg(feature = "backend-match")]
     SparseMatch { model: SparseMatchModel },
+    #[cfg(feature = "backend-context")]
+    OrderNGram { model: OrderNGramModel },
+    #[cfg(feature = "backend-context")]
+    WordContext { model: WordContextModel },
     #[cfg(feature = "backend-ppmd")]
     Ppmd { model: PpmdModel },
     #[cfg(feature = "backend-sequitur")]
@@ -1516,6 +888,14 @@ pub(crate) enum RatePdfPredictor {
     Mamba(MambaPredictor),
     #[cfg(feature = "backend-rwkv")]
     Rwkv(RwkvPredictor),
+    #[cfg(feature = "backend-bit-reservoir")]
+    BitReservoir {
+        model: BitReservoirModel,
+        pdf: Vec<f64>,
+        valid: bool,
+        native_prefix_progress: Option<usize>,
+        native_prediction: Option<(usize, BitReservoirPrediction)>,
+    },
     #[cfg(feature = "backend-zpaq")]
     Zpaq(ZpaqPredictor),
     #[cfg(feature = "backend-mixture")]
@@ -1558,6 +938,10 @@ impl RatePdfPredictor {
             Self::Match { .. } => Ok(()),
             #[cfg(feature = "backend-match")]
             Self::SparseMatch { .. } => Ok(()),
+            #[cfg(feature = "backend-context")]
+            Self::OrderNGram { .. } => Ok(()),
+            #[cfg(feature = "backend-context")]
+            Self::WordContext { .. } => Ok(()),
             #[cfg(feature = "backend-ppmd")]
             Self::Ppmd { .. } => Ok(()),
             #[cfg(feature = "backend-zpaq")]
@@ -1578,6 +962,20 @@ impl RatePdfPredictor {
             Self::Mamba(m) => m.begin_stream(total_len),
             #[cfg(feature = "backend-rwkv")]
             Self::Rwkv(m) => m.begin_stream(total_len),
+            #[cfg(feature = "backend-bit-reservoir")]
+            Self::BitReservoir {
+                model,
+                valid,
+                native_prefix_progress,
+                native_prediction,
+                ..
+            } => {
+                model.reset_all();
+                *valid = false;
+                *native_prefix_progress = None;
+                *native_prediction = None;
+                Ok(())
+            }
             #[cfg(feature = "backend-mixture")]
             Self::Mixture(m) => m.begin_stream(total_len),
             #[cfg(feature = "backend-calibrated")]
@@ -1603,6 +1001,10 @@ impl RatePdfPredictor {
             Self::Match { .. } => Ok(()),
             #[cfg(feature = "backend-match")]
             Self::SparseMatch { .. } => Ok(()),
+            #[cfg(feature = "backend-context")]
+            Self::OrderNGram { .. } => Ok(()),
+            #[cfg(feature = "backend-context")]
+            Self::WordContext { .. } => Ok(()),
             #[cfg(feature = "backend-ppmd")]
             Self::Ppmd { .. } => Ok(()),
             #[cfg(feature = "backend-ctw")]
@@ -1619,6 +1021,18 @@ impl RatePdfPredictor {
             Self::Mamba(m) => m.compressor.finish_online_policy_stream(),
             #[cfg(feature = "backend-rwkv")]
             Self::Rwkv(m) => m.finish_stream(),
+            #[cfg(feature = "backend-bit-reservoir")]
+            Self::BitReservoir {
+                valid,
+                native_prefix_progress,
+                native_prediction,
+                ..
+            } => {
+                *valid = false;
+                *native_prefix_progress = None;
+                *native_prediction = None;
+                Ok(())
+            }
             #[cfg(feature = "backend-mixture")]
             Self::Mixture(m) => m.finish_stream(),
             #[cfg(feature = "backend-calibrated")]
@@ -1650,6 +1064,18 @@ impl RatePdfPredictor {
             Self::Mamba(m) => Ok(m.pdf_next()),
             #[cfg(feature = "backend-rwkv")]
             Self::Rwkv(m) => Ok(m.pdf_next()),
+            #[cfg(feature = "backend-bit-reservoir")]
+            Self::BitReservoir {
+                model, pdf, valid, ..
+            } => {
+                if !*valid {
+                    let mut row = [0.0f64; 256];
+                    model.fill_byte_pdf(&mut row, PDF_MIN);
+                    pdf.copy_from_slice(&row);
+                    *valid = true;
+                }
+                Ok(pdf)
+            }
             #[cfg(feature = "backend-zpaq")]
             Self::Zpaq(m) => Ok(m.pdf_next()),
             #[cfg(feature = "backend-mixture")]
@@ -1658,6 +1084,10 @@ impl RatePdfPredictor {
             Self::Particle(m) => Ok(m.pdf_next()),
             #[cfg(feature = "backend-match")]
             Self::SparseMatch { model } => Ok(model.pdf()),
+            #[cfg(feature = "backend-context")]
+            Self::OrderNGram { model } => Ok(model.pdf(PDF_MIN)),
+            #[cfg(feature = "backend-context")]
+            Self::WordContext { model } => Ok(model.pdf(PDF_MIN)),
             #[cfg(feature = "backend-ppmd")]
             Self::Ppmd { model } => Ok(model.pdf()),
             #[cfg(feature = "backend-sequitur")]
@@ -1699,6 +1129,16 @@ impl RatePdfPredictor {
                 model.update(symbol);
                 Ok(())
             }
+            #[cfg(feature = "backend-context")]
+            Self::OrderNGram { model } => {
+                model.update(symbol);
+                Ok(())
+            }
+            #[cfg(feature = "backend-context")]
+            Self::WordContext { model } => {
+                model.update(symbol);
+                Ok(())
+            }
             #[cfg(feature = "backend-ppmd")]
             Self::Ppmd { model } => {
                 model.update(symbol);
@@ -1723,6 +1163,24 @@ impl RatePdfPredictor {
             Self::Mamba(m) => m.update(symbol),
             #[cfg(feature = "backend-rwkv")]
             Self::Rwkv(m) => m.update(symbol),
+            #[cfg(feature = "backend-bit-reservoir")]
+            Self::BitReservoir {
+                model,
+                valid,
+                native_prefix_progress,
+                native_prediction,
+                ..
+            } => {
+                debug_assert!(
+                    native_prefix_progress.is_none(),
+                    "bit-reservoir symbol update while native bitwise byte step is active"
+                );
+                *native_prefix_progress = None;
+                *native_prediction = None;
+                model.update_byte(symbol, true);
+                *valid = false;
+                Ok(())
+            }
             #[cfg(feature = "backend-zpaq")]
             Self::Zpaq(m) => {
                 m.update(symbol);
@@ -1817,6 +1275,8 @@ impl RatePdfPredictor {
             Self::Mixture(m) => m.has_recursive_native_bitwise_expert(),
             #[cfg(feature = "backend-calibrated")]
             Self::Calibrated { .. } => true,
+            #[cfg(feature = "backend-bit-reservoir")]
+            Self::BitReservoir { .. } => true,
             _ => false,
         }
     }
@@ -1827,6 +1287,21 @@ impl RatePdfPredictor {
             Self::Ctw(m) | Self::FacCtw(m) => Ok(m.can_fast_ac_bitwise()),
             #[cfg(feature = "backend-mixture")]
             Self::Mixture(m) => m.begin_bitwise_byte_step(),
+            #[cfg(feature = "backend-bit-reservoir")]
+            Self::BitReservoir {
+                native_prefix_progress,
+                native_prediction,
+                valid,
+                ..
+            } => {
+                if native_prefix_progress.is_some() {
+                    bail!("native recursive bitwise byte step is already active");
+                }
+                *native_prefix_progress = Some(0);
+                *native_prediction = None;
+                *valid = false;
+                Ok(true)
+            }
             #[cfg(feature = "backend-calibrated")]
             Self::Calibrated {
                 base,
@@ -1853,6 +1328,19 @@ impl RatePdfPredictor {
             Self::Ctw(m) | Self::FacCtw(m) => Ok(m.bit_prob_one_msb(bit_idx)),
             #[cfg(feature = "backend-mixture")]
             Self::Mixture(m) => m.bit_prob_one_msb(bit_idx),
+            #[cfg(feature = "backend-bit-reservoir")]
+            Self::BitReservoir {
+                model,
+                native_prefix_progress,
+                native_prediction,
+                ..
+            } => {
+                validate_bit_reservoir_prefix_index(*native_prefix_progress, bit_idx)?;
+                let prediction = model.predict_for_training();
+                let p1 = prediction.prob_one().clamp(PDF_MIN, 1.0 - PDF_MIN);
+                *native_prediction = Some((bit_idx, prediction));
+                Ok(p1)
+            }
             #[cfg(feature = "backend-calibrated")]
             Self::Calibrated {
                 base,
@@ -1877,6 +1365,27 @@ impl RatePdfPredictor {
             }
             #[cfg(feature = "backend-mixture")]
             Self::Mixture(m) => m.observe_bit_msb(bit_idx, bit),
+            #[cfg(feature = "backend-bit-reservoir")]
+            Self::BitReservoir {
+                model,
+                native_prefix_progress,
+                valid,
+                native_prediction,
+                ..
+            } => {
+                validate_bit_reservoir_prefix_index(*native_prefix_progress, bit_idx)?;
+                if let Some(next_bit_idx) = native_prefix_progress {
+                    *next_bit_idx += 1;
+                }
+                match native_prediction.take() {
+                    Some((cached_bit_idx, prediction)) if cached_bit_idx == bit_idx => {
+                        model.observe_bit_with_prediction(bit, &prediction);
+                    }
+                    _ => model.observe_bit(bit, true),
+                }
+                *valid = false;
+                Ok(())
+            }
             #[cfg(feature = "backend-calibrated")]
             Self::Calibrated {
                 base,
@@ -1895,12 +1404,77 @@ impl RatePdfPredictor {
         }
     }
 
+    fn native_recursive_observe_known_bit_msb(&mut self, bit_idx: usize, bit: bool) -> Result<f64> {
+        match self {
+            #[cfg(feature = "backend-ctw")]
+            Self::Ctw(m) | Self::FacCtw(m) => {
+                let p1 = m.bit_prob_one_msb(bit_idx);
+                m.update_bit_msb(bit_idx, bit);
+                Ok(p1)
+            }
+            #[cfg(feature = "backend-mixture")]
+            Self::Mixture(m) => m.observe_known_bit_msb(bit_idx, bit),
+            #[cfg(feature = "backend-bit-reservoir")]
+            Self::BitReservoir {
+                model,
+                native_prefix_progress,
+                valid,
+                native_prediction,
+                ..
+            } => {
+                validate_bit_reservoir_prefix_index(*native_prefix_progress, bit_idx)?;
+                if let Some(next_bit_idx) = native_prefix_progress {
+                    *next_bit_idx += 1;
+                }
+                let prediction = model.predict_for_training();
+                let p1 = prediction.prob_one().clamp(PDF_MIN, 1.0 - PDF_MIN);
+                model.observe_bit_with_prediction(bit, &prediction);
+                *native_prediction = None;
+                *valid = false;
+                Ok(p1)
+            }
+            #[cfg(feature = "backend-calibrated")]
+            Self::Calibrated {
+                base,
+                core,
+                bitwise,
+                valid,
+                ..
+            } => {
+                debug_assert!(core.byte_is_active());
+                let base_p1: f64 = bitwise.observe_known_bit_msb(base, bit_idx, bit)?;
+                let p1 = core.predict_bit_unchecked(base_p1);
+                core.observe_bit_unchecked(bit);
+                *valid = false;
+                Ok(p1)
+            }
+            _ => bail!("native recursive bitwise stepping is unavailable for this predictor"),
+        }
+    }
+
     fn finish_native_recursive_bitwise_byte_step(&mut self, symbol: u8) -> Result<()> {
         match self {
             #[cfg(feature = "backend-ctw")]
             Self::Ctw(_) | Self::FacCtw(_) => Ok(()),
             #[cfg(feature = "backend-mixture")]
             Self::Mixture(m) => m.finish_bitwise_symbol(symbol),
+            #[cfg(feature = "backend-bit-reservoir")]
+            Self::BitReservoir {
+                native_prefix_progress,
+                native_prediction,
+                ..
+            } => match native_prefix_progress {
+                Some(8) => {
+                    *native_prefix_progress = None;
+                    *native_prediction = None;
+                    let _ = symbol;
+                    Ok(())
+                }
+                Some(bits) => {
+                    bail!("native recursive bitwise finish requires 8 observed bits, got {bits}")
+                }
+                None => bail!("native recursive bitwise byte step is not active"),
+            },
             #[cfg(feature = "backend-calibrated")]
             Self::Calibrated {
                 base,
@@ -1927,11 +1501,22 @@ impl RatePdfPredictor {
     // Keep this separate from the live AC payload path so framed AC preserves
     // the v1 wire contract while still allowing backend-agnostic bitwise
     // stepping as an internal utility.
-    fn ac_step_bitwise<F>(&mut self, mut choose_bit: F) -> Result<u8>
+    //
+    // Takes the `PredictorBitwiseStepState` scratch as a parameter so hot
+    // streaming loops (encode/decode over an entire payload) can reuse one
+    // allocation across all symbols instead of paying a fresh
+    // `Box<BytePrefixCdf>` allocation (2056 bytes) per byte, most of which is
+    // immediately discarded by `prepare()` whenever the backend takes the
+    // `NativeRecursive`/`CachedCdf` fast paths (e.g. CTW, mixtures containing
+    // a native-bitwise expert, Calibrated).
+    fn ac_step_bitwise_with_state<F>(
+        &mut self,
+        state: &mut PredictorBitwiseStepState,
+        mut choose_bit: F,
+    ) -> Result<u8>
     where
         F: FnMut(usize, f64) -> Result<u8>,
     {
-        let mut state = PredictorBitwiseStepState::default();
         state.prepare(self)?;
         let mut symbol = 0u8;
         for bit_idx in 0..8usize {
@@ -1946,12 +1531,46 @@ impl RatePdfPredictor {
         Ok(symbol)
     }
 
-    fn ac_step_fast_bitwise<F>(&mut self, choose_bit: F) -> Result<u8>
+    #[cfg(test)]
+    fn ac_step_bitwise<F>(&mut self, choose_bit: F) -> Result<u8>
+    where
+        F: FnMut(usize, f64) -> Result<u8>,
+    {
+        let mut state = PredictorBitwiseStepState::default();
+        self.ac_step_bitwise_with_state(&mut state, choose_bit)
+    }
+
+    fn ac_step_fast_bitwise_with_state<F>(
+        &mut self,
+        state: &mut PredictorBitwiseStepState,
+        choose_bit: F,
+    ) -> Result<u8>
     where
         F: FnMut(usize, f64) -> Result<u8>,
     {
         debug_assert!(self.can_fast_ac_bitwise());
-        self.ac_step_bitwise(choose_bit)
+        self.ac_step_bitwise_with_state(state, choose_bit)
+    }
+
+    fn encode_known_symbol_ac_fast_bitwise_with_state(
+        &mut self,
+        state: &mut PredictorBitwiseStepState,
+        symbol: u8,
+        encoder: &mut ArithmeticEncoder<&mut Vec<u8>>,
+    ) -> Result<()> {
+        debug_assert!(self.can_fast_ac_bitwise());
+        state.prepare(self)?;
+        for bit_idx in 0..8usize {
+            let bit = ((symbol >> (7 - bit_idx)) & 1) == 1;
+            let p1_mix = state.observe_known_bit_msb(self, bit_idx, bit)?;
+            let split = binary_split_from_prob_one(p1_mix);
+            if bit {
+                encoder.encode_counts(split as u64, CDF_TOTAL as u64, CDF_TOTAL as u64)?;
+            } else {
+                encoder.encode_counts(0, split as u64, CDF_TOTAL as u64)?;
+            }
+        }
+        state.finish_symbol(self, symbol)
     }
 
     fn diagnostic_snapshot_subtree(
@@ -1998,12 +1617,13 @@ impl RatePdfPredictor {
 
     fn encode_symbol_ac_step<W: std::io::Write>(
         &mut self,
+        bitwise_state: &mut PredictorBitwiseStepState,
         symbol: u8,
         encoder: &mut ArithmeticEncoder<W>,
         cdf: &mut [u32; 257],
     ) -> Result<()> {
         if self.can_fast_ac_bitwise() {
-            self.ac_step_fast_bitwise(|bit_idx, p1_mix| {
+            self.ac_step_fast_bitwise_with_state(bitwise_state, |bit_idx, p1_mix| {
                 let bit = (symbol >> (7 - bit_idx)) & 1;
                 let split = binary_split_from_prob_one(p1_mix);
                 if bit == 0 {
@@ -2026,6 +1646,26 @@ impl RatePdfPredictor {
         encoder.encode_counts(cdf[sym] as u64, cdf[sym + 1] as u64, CDF_TOTAL as u64)?;
         self.update(symbol)
     }
+
+    fn logistic_match_state(&mut self) -> LogisticMatchState {
+        match self {
+            #[cfg(feature = "backend-match")]
+            Self::Match { model } => LogisticMatchState {
+                len_bucket: bucket_repeat_len(model.match_len()),
+                predicted_class: model.predicted_byte().map(classify_byte).unwrap_or(0),
+            },
+            #[cfg(feature = "backend-match")]
+            Self::SparseMatch { model } => LogisticMatchState {
+                len_bucket: bucket_repeat_len(model.match_len()),
+                predicted_class: model.predicted_byte().map(classify_byte).unwrap_or(0),
+            },
+            #[cfg(feature = "backend-mixture")]
+            Self::Mixture(m) => m.logistic_match_state(),
+            #[cfg(feature = "backend-calibrated")]
+            Self::Calibrated { base, .. } => base.logistic_match_state(),
+            _ => LogisticMatchState::default(),
+        }
+    }
 }
 
 #[inline]
@@ -2041,6 +1681,22 @@ fn binary_split_from_prob_one(p1: f64) -> u32 {
     split
 }
 
+#[cfg(feature = "backend-bit-reservoir")]
+fn validate_bit_reservoir_prefix_index(next_bit_idx: Option<usize>, bit_idx: usize) -> Result<()> {
+    let Some(expected) = next_bit_idx else {
+        bail!("native recursive bitwise byte step is not active");
+    };
+    if bit_idx >= 8 {
+        bail!("native recursive bitwise bit index {bit_idx} is out of range; expected 0..8");
+    }
+    if bit_idx != expected {
+        bail!(
+            "native recursive bitwise bit index {bit_idx} violated sequential stepping; expected {expected}"
+        );
+    }
+    Ok(())
+}
+
 /// This function should be considered when fine-tuning Compression/decompression for a particular runtime case. In particular, my benchmarking has shown that inlining is non-obvious in how it affects performance
 /// Inlining both encode and decode seems to cause performance issues with Match+AC decompression specifically, hence the odd configuration here for balance.
 /// Encode default: inline
@@ -2054,17 +1710,10 @@ fn encode_payload_ac_fast_bitwise(
     let mut out = Vec::new();
     {
         let mut enc = ArithmeticEncoder::new(&mut out);
+        let mut state = PredictorBitwiseStepState::default();
         for &symbol in data {
-            predictor.ac_step_fast_bitwise(|bit_idx, p1_mix| {
-                let bit = (symbol >> (7 - bit_idx)) & 1;
-                let split = binary_split_from_prob_one(p1_mix);
-                if bit == 0 {
-                    enc.encode_counts(0, split as u64, CDF_TOTAL as u64)?;
-                } else {
-                    enc.encode_counts(split as u64, CDF_TOTAL as u64, CDF_TOTAL as u64)?;
-                }
-                Ok(bit)
-            })?;
+            predictor
+                .encode_known_symbol_ac_fast_bitwise_with_state(&mut state, symbol, &mut enc)?;
         }
         let _ = enc.finish()?;
     }
@@ -2084,8 +1733,9 @@ fn decode_payload_ac_fast_bitwise(
 ) -> Result<Vec<u8>> {
     let mut dec = ArithmeticDecoder::new(payload)?;
     let mut out = Vec::with_capacity(out_len);
+    let mut state = PredictorBitwiseStepState::default();
     for _ in 0..out_len {
-        let symbol = predictor.ac_step_fast_bitwise(|_, p1_mix| {
+        let symbol = predictor.ac_step_fast_bitwise_with_state(&mut state, |_, p1_mix| {
             let split = binary_split_from_prob_one(p1_mix);
             dec.decode_binary_counts(split, CDF_TOTAL)
         })?;
@@ -2368,142 +2018,6 @@ fn normalize_pdf_vec_and_maybe_build_cdf(pdf: &mut [f64], cdf: Option<&mut [f64;
     }
 }
 
-#[inline]
-fn logsumexp_slice(vals: &[f64]) -> f64 {
-    let mut m = f64::NEG_INFINITY;
-    for &v in vals {
-        if v > m {
-            m = v;
-        }
-    }
-    if !m.is_finite() {
-        return m;
-    }
-    let mut s = 0.0;
-    for &v in vals {
-        s += (v - m).exp();
-    }
-    m + s.ln()
-}
-
-#[inline]
-fn logsumexp_expert_weights(experts: &[MixExpert]) -> f64 {
-    let mut m = f64::NEG_INFINITY;
-    for e in experts {
-        if e.log_weight > m {
-            m = e.log_weight;
-        }
-    }
-    if !m.is_finite() {
-        return m;
-    }
-    let mut s = 0.0;
-    for e in experts {
-        s += (e.log_weight - m).exp();
-    }
-    m + s.ln()
-}
-
-fn normalize_simplex_weights(weights: &mut [f64]) {
-    if weights.is_empty() {
-        return;
-    }
-    let mut sum = 0.0;
-    for weight in weights.iter_mut() {
-        if !weight.is_finite() || *weight < 0.0 {
-            *weight = 0.0;
-        }
-        sum += *weight;
-    }
-    if !sum.is_finite() || sum <= 0.0 {
-        let uniform = 1.0 / (weights.len() as f64);
-        weights.fill(uniform);
-        return;
-    }
-    for weight in weights.iter_mut() {
-        *weight /= sum;
-    }
-}
-
-fn normalized_mix_expert_prior_weights(experts: &[MixExpert], out: &mut [f64]) {
-    debug_assert_eq!(experts.len(), out.len());
-    let max_log = experts
-        .iter()
-        .map(|expert| expert.log_prior)
-        .fold(f64::NEG_INFINITY, f64::max);
-    for (slot, expert) in out.iter_mut().zip(experts.iter()) {
-        *slot = if max_log.is_finite() {
-            (expert.log_prior - max_log).exp()
-        } else {
-            0.0
-        };
-    }
-    normalize_simplex_weights(out);
-}
-
-fn set_mix_expert_log_weights_from_linear(experts: &mut [MixExpert], weights: &[f64]) {
-    for (expert, &weight) in experts.iter_mut().zip(weights.iter()) {
-        expert.log_weight = if weight > 0.0 {
-            weight.ln()
-        } else {
-            f64::NEG_INFINITY
-        };
-    }
-}
-
-fn apply_switching_weights(
-    experts: &mut [MixExpert],
-    prior_weights: &[f64],
-    alpha: f64,
-    posterior: &mut [f64],
-    scratch: &mut [f64],
-) {
-    if experts.is_empty() {
-        return;
-    }
-    debug_assert_eq!(experts.len(), prior_weights.len());
-
-    normalize_simplex_weights(posterior);
-    if experts.len() == 1 || alpha <= 0.0 {
-        set_mix_expert_log_weights_from_linear(experts, posterior);
-        return;
-    }
-
-    let num_switch_targets = prior_weights.iter().filter(|&&prior| prior < 1.0).count();
-    if num_switch_targets <= 1 {
-        set_mix_expert_log_weights_from_linear(experts, posterior);
-        return;
-    }
-
-    let mut switch_out_sum = 0.0;
-    for i in 0..experts.len() {
-        let denom = 1.0 - prior_weights[i];
-        if denom > 0.0 {
-            switch_out_sum += posterior[i] / denom;
-        }
-    }
-
-    for i in 0..experts.len() {
-        let prior = prior_weights[i];
-        let stay = (1.0 - alpha) * posterior[i];
-        let switch_in = if prior > 0.0 {
-            let denom = 1.0 - prior;
-            let switchable_mass = if denom > 0.0 {
-                switch_out_sum - posterior[i] / denom
-            } else {
-                0.0
-            };
-            alpha * prior * switchable_mass
-        } else {
-            0.0
-        };
-        scratch[i] = stay + switch_in;
-    }
-
-    normalize_simplex_weights(scratch);
-    set_mix_expert_log_weights_from_linear(experts, scratch);
-}
-
 #[allow(dead_code)]
 #[cfg(feature = "backend-zpaq")]
 fn _zpaq_marker(_: &ZpaqRateModel) {}
@@ -2782,6 +2296,11 @@ mod tests {
                 base_mix: 0.05,
                 confidence_scale: 1.0,
             },
+            RateBackend::OrderNGram {
+                order: 2,
+                hash_bits: 12,
+            },
+            RateBackend::WordContext { hash_bits: 12 },
             RateBackend::Ppmd {
                 order: 8,
                 memory_mb: 8,
@@ -2926,6 +2445,120 @@ mod tests {
         let dec =
             decompress_rate_bytes(&enc, &backend, CoderType::AC, FramingMode::Framed).unwrap();
         assert_eq!(dec, data);
+    }
+
+    #[test]
+    fn roundtrip_rate_ac_logistic_mixture() {
+        let data = b"logistic mixture ac roundtrip payload with repeated repeated words";
+        let spec = MixtureSpec::new(
+            MixtureKind::Logistic,
+            vec![
+                crate::MixtureExpertSpec {
+                    name: Some("ctw".to_string()),
+                    log_prior: 0.0,
+                    backend: RateBackend::Ctw { depth: 7 },
+                },
+                crate::MixtureExpertSpec {
+                    name: Some("match".to_string()),
+                    log_prior: -0.2,
+                    backend: RateBackend::Match {
+                        hash_bits: 18,
+                        min_len: 3,
+                        max_len: 64,
+                        base_mix: 0.03,
+                        confidence_scale: 1.0,
+                    },
+                },
+            ],
+        )
+        .with_alpha(0.03);
+        let backend = RateBackend::Mixture {
+            spec: Arc::new(spec),
+        };
+        let predictor = RatePdfPredictor::from_rate_backend(backend.clone()).unwrap();
+        assert!(
+            predictor.can_fast_ac_bitwise(),
+            "logistic mixtures should use their bitwise native path for AC"
+        );
+        let enc = compress_rate_bytes(data, &backend, CoderType::AC, FramingMode::Framed).unwrap();
+        let dec =
+            decompress_rate_bytes(&enc, &backend, CoderType::AC, FramingMode::Framed).unwrap();
+        assert_eq!(dec, data);
+    }
+
+    #[test]
+    fn roundtrip_rate_ac_single_expert_ctw_logistic_mixture() {
+        let data = b"single expert logistic ctw fast path payload";
+        let base = RateBackend::Ctw { depth: 8 };
+        let spec = MixtureSpec::new(
+            MixtureKind::Logistic,
+            vec![crate::MixtureExpertSpec {
+                name: Some("ctw".to_string()),
+                log_prior: 0.0,
+                backend: base.clone(),
+            }],
+        )
+        .with_alpha(0.03);
+        let backend = RateBackend::Mixture {
+            spec: Arc::new(spec),
+        };
+        let mix_predictor = RatePdfPredictor::from_rate_backend(backend.clone()).unwrap();
+        let base_predictor = RatePdfPredictor::from_rate_backend(base.clone()).unwrap();
+        assert!(
+            mix_predictor.can_fast_ac_bitwise(),
+            "one-expert logistic over CTW should expose the expert's native AC path"
+        );
+        assert_eq!(
+            mix_predictor.can_fast_ac_bitwise(),
+            base_predictor.can_fast_ac_bitwise(),
+            "one-expert logistic AC eligibility must match the sole expert"
+        );
+        let enc_mix =
+            compress_rate_bytes(data, &backend, CoderType::AC, FramingMode::Framed).unwrap();
+        let enc_base =
+            compress_rate_bytes(data, &base, CoderType::AC, FramingMode::Framed).unwrap();
+        assert_eq!(
+            enc_mix, enc_base,
+            "one-expert logistic AC bitstream must match the sole expert (no LogisticMixCore train)"
+        );
+        let dec =
+            decompress_rate_bytes(&enc_mix, &backend, CoderType::AC, FramingMode::Framed).unwrap();
+        assert_eq!(dec, data);
+
+        let enc_rans =
+            compress_rate_bytes(data, &backend, CoderType::RANS, FramingMode::Framed).unwrap();
+        let dec_rans =
+            decompress_rate_bytes(&enc_rans, &backend, CoderType::RANS, FramingMode::Framed)
+                .unwrap();
+        assert_eq!(dec_rans, data);
+    }
+
+    #[test]
+    fn single_expert_logistic_match_does_not_claim_logistic_ac_fast_path() {
+        let backend = RateBackend::Mixture {
+            spec: Arc::new(
+                MixtureSpec::new(
+                    MixtureKind::Logistic,
+                    vec![crate::MixtureExpertSpec {
+                        name: Some("match".to_string()),
+                        log_prior: 0.0,
+                        backend: RateBackend::Match {
+                            hash_bits: 18,
+                            min_len: 3,
+                            max_len: 64,
+                            base_mix: 0.03,
+                            confidence_scale: 1.0,
+                        },
+                    }],
+                )
+                .with_alpha(0.03),
+            ),
+        };
+        let predictor = RatePdfPredictor::from_rate_backend(backend).unwrap();
+        assert!(
+            !predictor.can_fast_ac_bitwise(),
+            "one-expert logistic over a non-bitwise expert must not enable the stretch-mixer AC path"
+        );
     }
 
     #[test]
@@ -3185,6 +2818,63 @@ mod tests {
     }
 
     #[test]
+    fn logistic_runtime_and_compression_predictor_align() {
+        let spec = MixtureSpec::new(MixtureKind::Logistic, alignment_experts()).with_alpha(0.03);
+        assert_runtime_and_compression_predictor_align(
+            spec,
+            b"logistic alignment check sequence",
+            1e-8,
+        );
+    }
+
+    #[test]
+    fn logistic_diagnostics_are_rejected() {
+        let spec = MixtureSpec::new(MixtureKind::Logistic, alignment_experts()).with_alpha(0.03);
+        let compiled = RateBackend::Mixture {
+            spec: Arc::new(spec),
+        }
+        .compile()
+        .expect("compile logistic mixture");
+        let mut predictor =
+            DiagnosticRatePredictor::from_compiled(&compiled).expect("build diagnostic predictor");
+        predictor.begin_stream(1).expect("begin stream");
+        let mut rows = Vec::new();
+        let err = predictor
+            .diagnostic_root_snapshot(b'a', None, &mut rows)
+            .expect_err("logistic ac-log-loss diagnostics must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not supported for logistic") || msg.contains("stretch-domain"),
+            "unexpected diagnostic rejection message: {msg}"
+        );
+    }
+
+    #[test]
+    fn non_logistic_mixture_does_not_allocate_logistic_tables() {
+        let spec = MixtureSpec::new(MixtureKind::Bayes, alignment_experts());
+        let compiled = RateBackend::Mixture {
+            spec: Arc::new(spec),
+        }
+        .compile()
+        .expect("compile bayes mixture");
+        let predictor =
+            RatePdfPredictor::from_compiled(&compiled).expect("build compression predictor");
+        match predictor {
+            RatePdfPredictor::Mixture(m) => {
+                assert!(
+                    !m.has_logistic_mixer(),
+                    "Bayes compression mixture must not allocate LogisticMixCore tables"
+                );
+                assert!(
+                    !m.has_neural_mixer(),
+                    "Bayes compression mixture must not allocate NeuralMixCore tables"
+                );
+            }
+            _ => panic!("expected mixture predictor"),
+        }
+    }
+
+    #[test]
     fn mdl_runtime_and_compression_predictor_align() {
         let spec = MixtureSpec::new(MixtureKind::Mdl, alignment_experts());
         assert_runtime_and_compression_predictor_align(spec, b"mdl alignment check sequence", 1e-8);
@@ -3355,6 +3045,70 @@ mod tests {
             b"single expert fac neural mixture bitwise byte step parity",
             1e-12,
             1e-12,
+        );
+
+        let single_logistic = RateBackend::Mixture {
+            spec: Arc::new(
+                MixtureSpec::new(
+                    MixtureKind::Logistic,
+                    vec![crate::MixtureExpertSpec {
+                        name: Some("ctw".to_string()),
+                        log_prior: 0.0,
+                        backend: RateBackend::Ctw { depth: 7 },
+                    }],
+                )
+                .with_alpha(0.03),
+            ),
+        };
+        let single_logistic_predictor =
+            RatePdfPredictor::from_rate_backend(single_logistic).unwrap();
+        assert!(
+            single_logistic_predictor.can_fast_ac_bitwise(),
+            "one-expert logistic over CTW should use the expert recursive AC path"
+        );
+        assert_bitwise_byte_step_matches_pdf_and_plain_update(
+            single_logistic_predictor,
+            b"single expert logistic ctw bitwise byte step parity",
+            1e-12,
+            1e-12,
+        );
+
+        let logistic = RateBackend::Mixture {
+            spec: Arc::new(
+                MixtureSpec::new(
+                    MixtureKind::Logistic,
+                    vec![
+                        crate::MixtureExpertSpec {
+                            name: Some("ctw".to_string()),
+                            log_prior: 0.0,
+                            backend: RateBackend::Ctw { depth: 7 },
+                        },
+                        crate::MixtureExpertSpec {
+                            name: Some("match".to_string()),
+                            log_prior: -0.2,
+                            backend: RateBackend::Match {
+                                hash_bits: 18,
+                                min_len: 3,
+                                max_len: 64,
+                                base_mix: 0.03,
+                                confidence_scale: 1.0,
+                            },
+                        },
+                    ],
+                )
+                .with_alpha(0.03),
+            ),
+        };
+        let logistic_predictor = RatePdfPredictor::from_rate_backend(logistic).unwrap();
+        assert!(
+            logistic_predictor.can_fast_ac_bitwise(),
+            "multi-expert logistic mixtures expose a bitwise AC path even when experts are byte-PDF predictors"
+        );
+        assert_bitwise_byte_step_matches_pdf_and_plain_update(
+            logistic_predictor,
+            b"logistic mixture bitwise byte step parity",
+            1e-8,
+            1e-8,
         );
 
         let mixed_direct = RateBackend::Mixture {

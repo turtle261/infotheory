@@ -243,6 +243,8 @@ def test_new_rate_backends_parse_and_execute(tmp_path):
                 "bins": 17,
                 "learning_rate": 0.05,
                 "bias_clip": 3.0,
+                "blend": 0.25,
+                "training_mode": "interpolated",
             }
         )
     )
@@ -250,6 +252,8 @@ def test_new_rate_backends_parse_and_execute(tmp_path):
     parsed_backends = [
         ait.rate_backend("match"),
         ait.rate_backend("sparse-match"),
+        ait.rate_backend("ngram", "2"),
+        ait.rate_backend("word-context", "8"),
         ait.rate_backend("ppmd", "12"),
         ait.rate_backend("mixture", str(mixture_path)),
         ait.rate_backend("particle", str(particle_path)),
@@ -263,18 +267,31 @@ def test_new_rate_backends_parse_and_execute(tmp_path):
         alpha=0.02,
         schedule=ait.MixtureScheduleMode.Theorem,
     )
+    logistic_spec = ait.MixtureSpec(
+        ait.MixtureKind.Logistic,
+        [
+            ait.MixtureExpertSpec(ait.RateBackend.ctw(6), name="ctw"),
+            ait.MixtureExpertSpec(ait.RateBackend.match(), name="match"),
+        ],
+        alpha=0.02,
+    )
     constructed_backends = [
         ait.RateBackend.match(hash_bits=18, min_len=3, max_len=96),
         ait.RateBackend.sparse_match(gap_min=2, gap_max=4),
+        ait.RateBackend.order_ngram(order=2, hash_bits=8),
+        ait.RateBackend.word_context(hash_bits=8),
         ait.RateBackend.ppmd(order=8, memory_mb=8),
         ait.RateBackend.mixture(mixture_spec),
+        ait.RateBackend.mixture(logistic_spec),
         ait.RateBackend.particle(particle_spec),
         ait.RateBackend.calibrated(
             ait.RateBackend.ctw(8),
-            ait.CalibrationContextKind.Text,
+            ait.CalibrationContextKind.Order1,
             bins=17,
             learning_rate=0.05,
             bias_clip=3.0,
+            blend=0.25,
+            training_mode=ait.CalibrationTrainingMode.Interpolated,
         ),
         ait.RateBackend.calibrated(ait.RateBackend.match(), "repeat", bins=9),
     ]
@@ -406,3 +423,75 @@ def test_search_pipeline_returns_results(tmp_path):
     assert isinstance(end, int)
     assert isinstance(score, float)
     assert "algorithm" in path, f"top result should be algorithm.txt, got {path}"
+
+def test_bitwise_empirical_invariants():
+    # Degenerate distributions
+    zeros = bytes([0] * 64)
+    ones = bytes([255] * 64)
+    mixed = b"the quick brown fox"
+
+    assert ait.empirical_entropy_bits(zeros) == 0.0
+    assert ait.empirical_entropy_bits(ones) == 0.0
+    assert ait.empirical_entropy_bits(mixed) > 0.0
+
+    assert ait.empirical_cross_entropy_bits(zeros, mixed) >= 0.0
+    assert ait.empirical_cross_entropy_bits(ones, mixed) >= 0.0
+
+    assert math.isclose(ait.tvd_bits(zeros, ones), 1.0)
+    assert math.isclose(ait.nhd_bits(zeros, ones), 1.0)
+    assert math.isclose(ait.js_div_bits(zeros, ones), 1.0)
+    assert ait.d_kl_bits(zeros, ones) > 0.0
+
+    x = b"abcdef"
+    y = b"ghijkl"
+
+    h_x = ait.empirical_entropy_bits(x)
+    h_y = ait.empirical_entropy_bits(y)
+    h_xy = ait.empirical_joint_entropy_bits(x, y)
+    mi = ait.empirical_mutual_information_bits(x, y)
+
+    assert h_xy <= 2.0 + 1e-12
+    assert mi >= 0.0
+    assert mi <= min(h_x, h_y) + 1e-12
+
+
+def test_bitwise_algorithmic_unit_conversion():
+    data = b"hello world, this is some data to test the algorithmic scaling"
+
+    # Using default CTW rate backend
+    h_bytes = ait.entropy_rate_bytes(data)
+    h_bits = ait.entropy_rate_per_bit(data)
+
+    assert h_bytes > 0.0
+    assert math.isclose(h_bits, h_bytes / 8.0, rel_tol=1e-9)
+
+    x = b"abcabcabc"
+    y = b"xyzxyzxyz"
+    assert math.isclose(
+        ait.mutual_information_rate_per_bit(x, y),
+        ait.mutual_information_rate_bytes(x, y) / 8.0,
+        rel_tol=1e-9,
+    )
+    assert math.isclose(
+        ait.conditional_entropy_rate_per_bit(x, y),
+        ait.conditional_entropy_rate_bytes(x, y) / 8.0,
+        rel_tol=1e-9,
+    )
+    assert math.isclose(ait.ned_rate_per_bit(x, y), ait.ned_bytes(x, y), rel_tol=1e-9)
+    assert math.isclose(
+        ait.ned_cons_rate_per_bit(x, y), ait.ned_cons_bytes(x, y), rel_tol=1e-9
+    )
+    assert math.isclose(ait.nte_rate_per_bit(x, y), ait.nte_bytes(x, y), rel_tol=1e-9)
+    assert math.isclose(
+        ait.resistance_to_transformation_per_bit(x, x),
+        ait.resistance_to_transformation_bytes(x, x),
+        rel_tol=1e-9,
+    )
+
+    id_bytes = ait.intrinsic_dependence_bytes(data)
+    id_bits = ait.intrinsic_dependence_bits(data)
+    assert 0.0 <= id_bytes <= 1.0
+    assert 0.0 <= id_bits <= 1.0
+    # Distinct framing: not a unit conversion of ID_bytes.
+    assert not math.isclose(id_bits, id_bytes / 8.0, rel_tol=1e-6, abs_tol=1e-6)
+

@@ -53,6 +53,25 @@ pub(crate) fn rate_plan_to_wrapper_sparse_match(plan: &RateBackendPlan) -> RateB
     }
 }
 
+pub(crate) fn rate_plan_to_wrapper_order_ngram(plan: &RateBackendPlan) -> RateBackend {
+    let RateBackendPlan::OrderNGram { order, hash_bits } = plan else {
+        unreachable!("order-ngram wrapper kernel used with non-order-ngram plan");
+    };
+    RateBackend::OrderNGram {
+        order: *order,
+        hash_bits: *hash_bits,
+    }
+}
+
+pub(crate) fn rate_plan_to_wrapper_word_context(plan: &RateBackendPlan) -> RateBackend {
+    let RateBackendPlan::WordContext { hash_bits } = plan else {
+        unreachable!("word-context wrapper kernel used with non-word-context plan");
+    };
+    RateBackend::WordContext {
+        hash_bits: *hash_bits,
+    }
+}
+
 pub(crate) fn rate_plan_to_wrapper_ppmd(plan: &RateBackendPlan) -> RateBackend {
     let RateBackendPlan::Ppmd { order, memory_mb } = plan else {
         unreachable!("ppmd wrapper kernel used with non-ppmd plan");
@@ -128,6 +147,16 @@ pub(crate) fn rate_plan_to_wrapper_rwkv7(plan: &RateBackendPlan) -> RateBackend 
     }
 }
 
+#[cfg(feature = "backend-bit-reservoir")]
+pub(crate) fn rate_plan_to_wrapper_bit_reservoir(plan: &RateBackendPlan) -> RateBackend {
+    let RateBackendPlan::BitReservoir { config } = plan else {
+        unreachable!("bit-reservoir wrapper kernel used with non-bit-reservoir plan");
+    };
+    RateBackend::BitReservoir {
+        config: config.clone(),
+    }
+}
+
 pub(crate) fn rate_plan_to_wrapper_mixture(plan: &RateBackendPlan) -> RateBackend {
     let RateBackendPlan::Mixture {
         kind,
@@ -169,9 +198,11 @@ pub(crate) fn rate_plan_to_wrapper_particle(plan: &RateBackendPlan) -> RateBacke
 pub(crate) fn rate_plan_to_wrapper_calibrated(plan: &RateBackendPlan) -> RateBackend {
     let RateBackendPlan::Calibrated {
         context,
+        training_mode,
         bins,
         learning_rate,
         bias_clip,
+        blend,
         base,
     } = plan
     else {
@@ -181,9 +212,11 @@ pub(crate) fn rate_plan_to_wrapper_calibrated(plan: &RateBackendPlan) -> RateBac
         spec: Arc::new(CalibratedSpec {
             base: rate_plan_to_wrapper(base.as_ref()),
             context: *context,
+            training_mode: *training_mode,
             bins: *bins,
             learning_rate: *learning_rate,
             bias_clip: *bias_clip,
+            blend: *blend,
         }),
     }
 }
@@ -319,6 +352,34 @@ pub(crate) fn rate_plan_default_name_sparse_match(plan: &RateBackendPlan) -> Str
     "sparse-match".to_string()
 }
 
+pub(crate) fn rate_plan_display_label_order_ngram(plan: &RateBackendPlan) -> String {
+    let RateBackendPlan::OrderNGram { order, hash_bits } = plan else {
+        unreachable!("order-ngram label kernel used with non-order-ngram plan");
+    };
+    format!("order-ngram(order={order},hash_bits={hash_bits})")
+}
+
+pub(crate) fn rate_plan_default_name_order_ngram(plan: &RateBackendPlan) -> String {
+    let RateBackendPlan::OrderNGram { order, hash_bits } = plan else {
+        unreachable!("order-ngram default-name kernel used with non-order-ngram plan");
+    };
+    format!("ngram(o={order},h={hash_bits})")
+}
+
+pub(crate) fn rate_plan_display_label_word_context(plan: &RateBackendPlan) -> String {
+    let RateBackendPlan::WordContext { hash_bits } = plan else {
+        unreachable!("word-context label kernel used with non-word-context plan");
+    };
+    format!("word-context(hash_bits={hash_bits})")
+}
+
+pub(crate) fn rate_plan_default_name_word_context(plan: &RateBackendPlan) -> String {
+    let RateBackendPlan::WordContext { hash_bits } = plan else {
+        unreachable!("word-context default-name kernel used with non-word-context plan");
+    };
+    format!("word(ctx={hash_bits})")
+}
+
 pub(crate) fn rate_plan_display_label_ppmd(plan: &RateBackendPlan) -> String {
     let RateBackendPlan::Ppmd { order, memory_mb } = plan else {
         unreachable!("ppmd label kernel used with non-ppmd plan");
@@ -436,6 +497,33 @@ pub(crate) fn rate_plan_default_name_rwkv7(plan: &RateBackendPlan) -> String {
     format!("rwkv7({method})")
 }
 
+#[cfg(feature = "backend-bit-reservoir")]
+pub(crate) fn rate_plan_display_label_bit_reservoir(plan: &RateBackendPlan) -> String {
+    let RateBackendPlan::BitReservoir { config } = plan else {
+        unreachable!("bit-reservoir label kernel used with non-bit-reservoir plan");
+    };
+    format!(
+        "bit-reservoir(hidden={},delay_bits={},embedding_bits={},lr={},decay={},seed={})",
+        config.hidden,
+        config.delay_bits,
+        config.embedding_bits,
+        config.learning_rate,
+        config.learning_rate_decay,
+        config.seed
+    )
+}
+
+#[cfg(feature = "backend-bit-reservoir")]
+pub(crate) fn rate_plan_default_name_bit_reservoir(plan: &RateBackendPlan) -> String {
+    let RateBackendPlan::BitReservoir { config } = plan else {
+        unreachable!("bit-reservoir default-name kernel used with non-bit-reservoir plan");
+    };
+    format!(
+        "bit-reservoir(h={},d={},eb={})",
+        config.hidden, config.delay_bits, config.embedding_bits
+    )
+}
+
 pub(crate) fn rate_plan_display_label_mixture(plan: &RateBackendPlan) -> String {
     let RateBackendPlan::Mixture { kind, .. } = plan else {
         unreachable!("mixture label kernel used with non-mixture plan");
@@ -447,6 +535,7 @@ pub(crate) fn rate_plan_display_label_mixture(plan: &RateBackendPlan) -> String 
         MixtureKind::Convex => "mixture:convex".to_string(),
         MixtureKind::Mdl => "mixture:mdl".to_string(),
         MixtureKind::Neural => "mixture:neural".to_string(),
+        MixtureKind::Logistic => "mixture:logistic".to_string(),
     }
 }
 
@@ -461,6 +550,7 @@ pub(crate) fn rate_plan_default_name_mixture(plan: &RateBackendPlan) -> String {
         MixtureKind::Convex => "convex",
         MixtureKind::Mdl => "mdl",
         MixtureKind::Neural => "neural",
+        MixtureKind::Logistic => "logistic",
     };
     format!("mix({kind})")
 }
@@ -485,16 +575,18 @@ pub(crate) fn rate_plan_default_name_particle(plan: &RateBackendPlan) -> String 
 pub(crate) fn rate_plan_display_label_calibrated(plan: &RateBackendPlan) -> String {
     let RateBackendPlan::Calibrated {
         context,
+        training_mode,
         bins,
         learning_rate,
         bias_clip,
+        blend,
         ..
     } = plan
     else {
         unreachable!("calibrated label kernel used with non-calibrated plan");
     };
     format!(
-        "calibrated(context={context:?},bins={bins},learning_rate={learning_rate},bias_clip={bias_clip})"
+        "calibrated(context={context:?},training_mode={training_mode:?},bins={bins},learning_rate={learning_rate},bias_clip={bias_clip},blend={blend})"
     )
 }
 
@@ -588,6 +680,23 @@ pub(crate) fn encode_rate_payload_sparse_match(plan: &RateBackendPlan, out: &mut
     push_f64(out, *confidence_scale);
 }
 
+pub(crate) fn encode_rate_payload_order_ngram(plan: &RateBackendPlan, out: &mut Vec<u8>) {
+    let RateBackendPlan::OrderNGram { order, hash_bits } = plan else {
+        unreachable!("order-ngram encoder kernel used with non-order-ngram plan");
+    };
+    out.push(14);
+    push_usize(out, *order);
+    push_usize(out, *hash_bits);
+}
+
+pub(crate) fn encode_rate_payload_word_context(plan: &RateBackendPlan, out: &mut Vec<u8>) {
+    let RateBackendPlan::WordContext { hash_bits } = plan else {
+        unreachable!("word-context encoder kernel used with non-word-context plan");
+    };
+    out.push(15);
+    push_usize(out, *hash_bits);
+}
+
 pub(crate) fn encode_rate_payload_ppmd(plan: &RateBackendPlan, out: &mut Vec<u8>) {
     let RateBackendPlan::Ppmd { order, memory_mb } = plan else {
         unreachable!("ppmd encoder kernel used with non-ppmd plan");
@@ -658,6 +767,26 @@ pub(crate) fn encode_rate_payload_rwkv7(plan: &RateBackendPlan, out: &mut Vec<u8
     push_asset_ref(out, asset.as_ref());
 }
 
+#[cfg(feature = "backend-bit-reservoir")]
+pub(crate) fn encode_rate_payload_bit_reservoir(plan: &RateBackendPlan, out: &mut Vec<u8>) {
+    let RateBackendPlan::BitReservoir { config } = plan else {
+        unreachable!("bit-reservoir encoder kernel used with non-bit-reservoir plan");
+    };
+    out.push(13);
+    push_usize(out, config.hidden);
+    push_usize(out, config.delay_bits);
+    push_usize(out, config.embedding_bits);
+    push_f64(out, config.learning_rate);
+    push_f64(out, config.learning_rate_decay);
+    push_f64(out, config.weight_decay);
+    push_f64(out, config.state_decay);
+    push_f64(out, config.recurrent_scale);
+    push_f64(out, config.input_scale);
+    push_f64(out, config.phase_scale);
+    push_f64(out, config.grad_clip);
+    push_varint(out, config.seed);
+}
+
 pub(crate) fn encode_rate_payload_mixture(plan: &RateBackendPlan, out: &mut Vec<u8>) {
     let RateBackendPlan::Mixture {
         kind,
@@ -693,9 +822,11 @@ pub(crate) fn encode_rate_payload_particle(plan: &RateBackendPlan, out: &mut Vec
 pub(crate) fn encode_rate_payload_calibrated(plan: &RateBackendPlan, out: &mut Vec<u8>) {
     let RateBackendPlan::Calibrated {
         context,
+        training_mode,
         bins,
         learning_rate,
         bias_clip,
+        blend,
         base,
     } = plan
     else {
@@ -703,9 +834,11 @@ pub(crate) fn encode_rate_payload_calibrated(plan: &RateBackendPlan, out: &mut V
     };
     out.push(12);
     out.push(calibration_context_tag(*context));
+    out.push(calibration_training_mode_tag(*training_mode));
     push_usize(out, *bins);
     push_f64(out, *learning_rate);
     push_f64(out, *bias_clip);
+    push_f64(out, *blend);
     encode_rate_backend_payload(base.as_ref(), out);
 }
 

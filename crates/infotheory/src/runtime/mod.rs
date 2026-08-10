@@ -5,8 +5,12 @@
 
 use self::plan_macros::expect_plan_ref;
 use crate::api::{CompressionBackend, RateBackend};
+#[cfg(feature = "backend-bit-reservoir")]
+use crate::backends::bit_reservoir::BitReservoirModel;
 #[cfg(feature = "backend-calibrated")]
 use crate::backends::calibration::CalibratorCore;
+#[cfg(feature = "backend-context")]
+use crate::backends::context_counter::{OrderNGramModel, WordContextModel};
 #[cfg(feature = "backend-ctw")]
 use crate::backends::ctw::{ContextTree, FacContextTree, ctw_symbol_bit_msb};
 #[cfg(feature = "backend-match")]
@@ -54,12 +58,15 @@ pub enum RateBackendKind {
     FacCtw,
     Match,
     SparseMatch,
+    OrderNGram,
+    WordContext,
     Ppmd,
     Sequitur,
     Calibrated,
     Zpaq,
     Mixture,
     Particle,
+    BitReservoir,
     Mamba,
     Rwkv7,
 }
@@ -579,6 +586,64 @@ define_rate_backend_catalog! {
         conditional_chain_rate: conditional_chain_prequential,
     },
     backend {
+        kind: OrderNGram,
+        canonical: "order-ngram",
+        aliases: ["order-ngram", "ngram"],
+        feature: "backend-context",
+        spec_helper_refs: anchor,
+        metric_helper_refs: anchor,
+        compile_plan: crate::spec::core::compile_rate_plan_order_ngram,
+        to_wrapper: crate::spec::core::rate_plan_to_wrapper_order_ngram,
+        encode_payload: crate::spec::core::encode_rate_payload_order_ngram,
+        display_label: crate::spec::core::rate_plan_display_label_order_ngram,
+        default_name: crate::spec::core::rate_plan_default_name_order_ngram,
+        trace_strategy: PublicTraceStrategy::PredictorBacked,
+        supports_biased_entropy: true,
+        supports_frozen_conditioning: true,
+        supports_rate_coded_compression: true,
+        supports_native_bit_prediction: crate::runtime::capability_always_false,
+        supports_byte_prefix_mass: crate::runtime::capability_always_true,
+        supports_efficient_byte_packed_bit_sessions: crate::runtime::capability_always_true,
+        supports_reversible_bit_updates: crate::runtime::capability_always_false,
+        method_family: None,
+        contains_zpaq: crate::spec::core::rate_plan_contains_zpaq_false,
+        build_predictor: predictor_builders::build_predictor_order_ngram,
+        build_binary_token_predictor: predictor_builders::build_predictor_order_ngram,
+        build_pdf_predictor: pdf_predictor_builders::build_pdf_predictor_order_ngram,
+        entropy_rate: entropy_prequential,
+        joint_entropy_rate: joint_entropy_prequential,
+        conditional_chain_rate: conditional_chain_prequential,
+    },
+    backend {
+        kind: WordContext,
+        canonical: "word-context",
+        aliases: ["word-context", "word"],
+        feature: "backend-context",
+        spec_helper_refs: anchor,
+        metric_helper_refs: anchor,
+        compile_plan: crate::spec::core::compile_rate_plan_word_context,
+        to_wrapper: crate::spec::core::rate_plan_to_wrapper_word_context,
+        encode_payload: crate::spec::core::encode_rate_payload_word_context,
+        display_label: crate::spec::core::rate_plan_display_label_word_context,
+        default_name: crate::spec::core::rate_plan_default_name_word_context,
+        trace_strategy: PublicTraceStrategy::PredictorBacked,
+        supports_biased_entropy: true,
+        supports_frozen_conditioning: true,
+        supports_rate_coded_compression: true,
+        supports_native_bit_prediction: crate::runtime::capability_always_false,
+        supports_byte_prefix_mass: crate::runtime::capability_always_true,
+        supports_efficient_byte_packed_bit_sessions: crate::runtime::capability_always_true,
+        supports_reversible_bit_updates: crate::runtime::capability_always_false,
+        method_family: None,
+        contains_zpaq: crate::spec::core::rate_plan_contains_zpaq_false,
+        build_predictor: predictor_builders::build_predictor_word_context,
+        build_binary_token_predictor: predictor_builders::build_predictor_word_context,
+        build_pdf_predictor: pdf_predictor_builders::build_pdf_predictor_word_context,
+        entropy_rate: entropy_prequential,
+        joint_entropy_rate: joint_entropy_prequential,
+        conditional_chain_rate: conditional_chain_prequential,
+    },
+    backend {
         kind: Ppmd,
         canonical: "ppmd",
         aliases: ["ppmd"],
@@ -811,6 +876,35 @@ define_rate_backend_catalog! {
         entropy_rate: entropy_prequential,
         joint_entropy_rate: joint_entropy_prequential,
         conditional_chain_rate: conditional_chain_prequential,
+    },
+    backend {
+        kind: BitReservoir,
+        canonical: "bit-reservoir",
+        aliases: ["bit-reservoir", "bitreservoir"],
+        feature: "backend-bit-reservoir",
+        spec_helper_refs: drop,
+        metric_helper_refs: drop,
+        compile_plan: crate::spec::core::compile_rate_plan_bit_reservoir,
+        to_wrapper: crate::spec::core::rate_plan_to_wrapper_bit_reservoir,
+        encode_payload: crate::spec::core::encode_rate_payload_bit_reservoir,
+        display_label: crate::spec::core::rate_plan_display_label_bit_reservoir,
+        default_name: crate::spec::core::rate_plan_default_name_bit_reservoir,
+        trace_strategy: PublicTraceStrategy::PredictorBacked,
+        supports_biased_entropy: true,
+        supports_frozen_conditioning: true,
+        supports_rate_coded_compression: true,
+        supports_native_bit_prediction: crate::runtime::capability_always_true,
+        supports_byte_prefix_mass: crate::runtime::capability_always_true,
+        supports_efficient_byte_packed_bit_sessions: crate::runtime::capability_always_true,
+        supports_reversible_bit_updates: crate::runtime::capability_always_false,
+        method_family: None,
+        contains_zpaq: crate::spec::core::rate_plan_contains_zpaq_false,
+        build_predictor: predictor_builders::build_predictor_bit_reservoir,
+        build_binary_token_predictor: predictor_builders::build_predictor_binary_tokens_bit_reservoir,
+        build_pdf_predictor: pdf_predictor_builders::build_pdf_predictor_bit_reservoir,
+        entropy_rate: entropy_bit_reservoir,
+        joint_entropy_rate: joint_entropy_bit_reservoir,
+        conditional_chain_rate: conditional_chain_bit_reservoir,
     },
     backend {
         kind: Mamba,
@@ -1122,6 +1216,20 @@ fn with_zpaq_backend_plan<T>(
     f(method)
 }
 
+#[cfg(feature = "backend-bit-reservoir")]
+/// Execute `f` with the bit-reservoir config from a compiled backend.
+fn with_bit_reservoir_backend_plan<T>(
+    backend: &CompiledRateBackend,
+    f: impl FnOnce(&crate::api::BitReservoirConfig) -> InfotheoryResult<T>,
+) -> InfotheoryResult<T> {
+    expect_plan_ref!(
+        backend.plan(),
+        crate::spec::core::RateBackendPlan::BitReservoir { config },
+        "bit-reservoir kernel used with non-bit-reservoir plan"
+    );
+    f(config)
+}
+
 #[cfg(feature = "backend-particle")]
 /// Execute `f` with the particle spec from a compiled backend.
 fn with_particle_backend_plan<T>(
@@ -1386,6 +1494,35 @@ fn conditional_chain_zpaq(
 ) -> InfotheoryResult<f64> {
     with_zpaq_backend_plan(backend, |method| {
         zpaq_conditional_chain_rate_bits(method, prefix_parts, data)
+    })
+}
+
+#[cfg(feature = "backend-bit-reservoir")]
+fn entropy_bit_reservoir(data: &[u8], backend: &CompiledRateBackend) -> InfotheoryResult<f64> {
+    with_bit_reservoir_backend_plan(backend, |config| {
+        bit_reservoir_entropy_rate_bits(config, data)
+    })
+}
+
+#[cfg(feature = "backend-bit-reservoir")]
+fn joint_entropy_bit_reservoir(
+    x: &[u8],
+    y: &[u8],
+    backend: &CompiledRateBackend,
+) -> InfotheoryResult<f64> {
+    with_bit_reservoir_backend_plan(backend, |config| {
+        bit_reservoir_joint_entropy_rate_bits(config, x, y)
+    })
+}
+
+#[cfg(feature = "backend-bit-reservoir")]
+fn conditional_chain_bit_reservoir(
+    prefix_parts: &[&[u8]],
+    data: &[u8],
+    backend: &CompiledRateBackend,
+) -> InfotheoryResult<f64> {
+    with_bit_reservoir_backend_plan(backend, |config| {
+        bit_reservoir_conditional_chain_rate_bits(config, prefix_parts, data)
     })
 }
 
@@ -1868,6 +2005,57 @@ fn zpaq_joint_entropy_rate_bits(method: &str, x: &[u8], y: &[u8]) -> InfotheoryR
     Ok(bits / (x.len() as f64))
 }
 
+#[cfg(feature = "backend-bit-reservoir")]
+fn bit_reservoir_entropy_rate_bits(
+    config: &crate::api::BitReservoirConfig,
+    data: &[u8],
+) -> InfotheoryResult<f64> {
+    if data.is_empty() {
+        return Ok(0.0);
+    }
+    let mut model = BitReservoirModel::new(config.clone()).map_err(|err| {
+        InfotheoryError::invalid_backend_config(format!("bit-reservoir config invalid: {err}"))
+    })?;
+    let bits = model.update_and_score_bits(data);
+    Ok(bits / (data.len() as f64))
+}
+
+#[cfg(feature = "backend-bit-reservoir")]
+fn bit_reservoir_joint_entropy_rate_bits(
+    config: &crate::api::BitReservoirConfig,
+    x: &[u8],
+    y: &[u8],
+) -> InfotheoryResult<f64> {
+    if x.is_empty() || y.is_empty() {
+        return Ok(0.0);
+    }
+    let joint = interleave_aligned_bytes(x, y);
+    let mut model = BitReservoirModel::new(config.clone()).map_err(|err| {
+        InfotheoryError::invalid_backend_config(format!("bit-reservoir config invalid: {err}"))
+    })?;
+    let bits = model.update_and_score_bits(&joint);
+    Ok(bits / (x.len() as f64))
+}
+
+#[cfg(feature = "backend-bit-reservoir")]
+fn bit_reservoir_conditional_chain_rate_bits(
+    config: &crate::api::BitReservoirConfig,
+    prefix_parts: &[&[u8]],
+    data: &[u8],
+) -> InfotheoryResult<f64> {
+    if data.is_empty() {
+        return Ok(0.0);
+    }
+    let mut model = BitReservoirModel::new(config.clone()).map_err(|err| {
+        InfotheoryError::invalid_backend_config(format!("bit-reservoir config invalid: {err}"))
+    })?;
+    for &part in prefix_parts {
+        let _ = model.update_and_score_bits(part);
+    }
+    let bits = model.update_and_score_bits(data);
+    Ok(bits / (data.len() as f64))
+}
+
 #[cfg(feature = "backend-mixture")]
 fn build_compiled_mixture_runtime(
     backend: &CompiledRateBackend,
@@ -2326,10 +2514,9 @@ mod tests {
     #[cfg(any(
         feature = "backend-ctw",
         feature = "backend-zpaq",
-        feature = "backend-mixture",
         feature = "backend-rwkv",
         feature = "backend-mamba",
-        feature = "all-backends"
+        feature = "backend-bit-reservoir"
     ))]
     fn compiled_rate_backend(backend: &RateBackend) -> CompiledRateBackend {
         backend.compile().expect("compiled rate backend")
@@ -2457,8 +2644,17 @@ mod tests {
             .iter()
             .filter(|descriptor| descriptor.enabled)
         {
-            let backend = sample_rate_backend_for_kind(descriptor.kind)
-                .unwrap_or_else(|| panic!("missing sample backend for {:?}", descriptor.kind));
+            let Some(backend) = sample_rate_backend_for_kind(descriptor.kind) else {
+                // Composite-only feature slices can enable a construction
+                // kernel without enabling any primitive expert/base backend.
+                // There is no finite sample graph to build in that topology.
+                assert!(matches!(
+                    descriptor.kind,
+                    RateBackendKind::Mixture | RateBackendKind::Calibrated
+                ));
+                assert!(first_enabled_default_rate_backend_spec().is_none());
+                continue;
+            };
             let compiled = backend.compile().unwrap_or_else(|err| {
                 panic!(
                     "sample backend {:?} failed to compile: {err}",
@@ -2724,7 +2920,57 @@ mod tests {
         assert!(fac_cond.is_finite() && fac_cond >= 0.0);
     }
 
-    #[cfg(feature = "backend-mixture")]
+    #[cfg(feature = "backend-bit-reservoir")]
+    #[test]
+    fn bit_reservoir_runtime_entropy_helpers_are_finite() {
+        let backend = compiled_rate_backend(&RateBackend::BitReservoir {
+            config: crate::api::BitReservoirConfig {
+                hidden: 4,
+                delay_bits: 8,
+                embedding_bits: 8,
+                learning_rate: 0.02,
+                learning_rate_decay: 0.0,
+                weight_decay: 0.0,
+                state_decay: 0.75,
+                recurrent_scale: 0.35,
+                input_scale: 0.8,
+                phase_scale: 0.2,
+                grad_clip: 1.0,
+                seed: 7,
+            },
+        });
+
+        assert_eq!(
+            bit_reservoir_joint_entropy_rate_bits(
+                &crate::api::BitReservoirConfig::default(),
+                b"",
+                b"nonempty"
+            )
+            .expect("empty bit-reservoir joint"),
+            0.0
+        );
+        assert_eq!(
+            bit_reservoir_conditional_chain_rate_bits(
+                &crate::api::BitReservoirConfig::default(),
+                &[b"prefix"],
+                b""
+            )
+            .expect("empty bit-reservoir conditional chain"),
+            0.0
+        );
+
+        let entropy =
+            entropy_bit_reservoir(b"reservoir bytes", &backend).expect("bit-reservoir entropy");
+        let joint =
+            joint_entropy_bit_reservoir(b"abcd", b"wxyz", &backend).expect("bit-reservoir joint");
+        let cond = conditional_chain_bit_reservoir(&[b"seed"], b"more", &backend)
+            .expect("bit-reservoir conditional");
+        assert!(entropy.is_finite() && entropy >= 0.0);
+        assert!(joint.is_finite() && joint >= 0.0);
+        assert!(cond.is_finite() && cond >= 0.0);
+    }
+
+    #[cfg(all(feature = "backend-mixture", feature = "backend-ctw"))]
     #[test]
     fn mixture_runtime_entropy_helpers_are_finite() {
         let mixture = RateBackend::Mixture {

@@ -27,20 +27,22 @@
 //!     optional RWKV7 compressor, and the rate-coded compressor wrapping
 //!     any rate backend). Rate backends are pluggable through
 //!     [`crate::api::RateBackend`] — CTW, FAC-CTW, ROSA+, PPMD, Sequitur,
-//!     contiguous and sparse local-match models, online RWKV7 and Mamba
-//!     neural backends, calibrated wrappers, particle-filter backends,
+//!     contiguous and sparse local-match models, a bit-native reservoir
+//!     backend, online RWKV7 and Mamba neural backends,
+//!     calibrated wrappers, particle-filter backends,
 //!     ZPAQ-as-rate, and arbitrary mixture / ensemble compositions
 //!     thereof — and are interchangeable wherever a `RateBackend` is
 //!     consumed.
 //! 2.  **Shannon information theory (empirical / IID plug-in)**:
 //!     estimates classical Shannon quantities directly from observed
-//!     byte frequencies, with no learned model. The class is model-free:
+//!     symbol frequencies (bytewise alphabet `{0,…,255}` or pooled bitwise
+//!     alphabet `{0,1}`), with no learned model. The class is model-free:
 //!     it plugs the empirical distribution into Shannon's formulae and
 //!     returns an order-0 / IID estimator. It supplies the order-0
 //!     entropy `H₀(X)`, joint and conditional `H₀`, `I₀(X;Y)`, and the
 //!     `empirical_*` analogues of NED, NTE, cross-entropy, and
 //!     resistance, plus the classical divergences and distances over
-//!     byte distributions: total variation distance (TVD), normalized
+//!     those distributions: total variation distance (TVD), normalized
 //!     Hellinger distance (NHD), Kullback–Leibler divergence (KL), and
 //!     Jensen–Shannon divergence (JSD). These are useful as model-free
 //!     baselines, axiom test fixtures, and as the appropriate estimator
@@ -54,13 +56,36 @@
 //! compressor ecosystem and the metrics (NCD, compressed-size, the
 //! entropy *rate*) that have no order-0 plug-in counterpart.
 //!
+//! ## Alphabet Framing: `_bytes`, `_bits`, and `_per_bit`
+//!
+//! Empirical and algorithmic metrics are framed over two alphabets.
+//! The suffix encodes that framing explicitly so callers never confuse a
+//! rescaling with a distinct estimator:
+//!
+//! * **`_bytes` (alphabet `{0,…,255}`).** Empirical plug-ins histogram whole
+//!   bytes; algorithmic rates divide total base-2 log-loss `L` by the byte
+//!   count `N`, yielding **bits per byte**. Maximum empirical entropy is 8 bits.
+//! * **`_bits` (alphabet `{0,1}`).** Empirical plug-ins treat the input as
+//!   `8N` pooled bits (not position-stratified) and form a binary histogram.
+//!   Because bits within a byte are correlated, these quantities are
+//!   **not** a rescaling of their `_bytes` counterparts. Maximum empirical
+//!   entropy is 1 bit.
+//! * **`_per_bit` (algorithmic unit conversion).** Predictive estimators
+//!   measure the same total information content `L` over the same sequence;
+//!   the `_per_bit` wrappers return `L / (8N)` (**bits per bit**), i.e.
+//!   exactly the corresponding `_bytes` rate divided by 8. This conversion
+//!   is valid because all algorithmic estimators in this crate report
+//!   log-loss in base-2 bits (not nats). Normalized ratios such as NED and
+//!   NTE are scale-invariant (`NED_bits ≡ NED_bytes`); the `_per_bit`
+//!   aliases exist only for naming uniformity on the bitwise surface.
+//!
 //! ## Mathematical Primitives
 //!
 //! The library implements the following core measures. For sequential data,
 //! `*_rate_*` and explicit-backend variants use the configured
 //! [`crate::api::RateBackend`] to estimate the entropy rate `Ĥ(X)`, while
-//! `empirical_*` variants compute the order-0 plug-in `H₀(X)` from byte
-//! histograms.
+//! `empirical_*_bytes` / `empirical_*_bits` compute the order-0 plug-in
+//! `H₀(X)` from byte or pooled-bit histograms.
 //!
 //! ### 1. Normalized Compression Distance (NCD)
 //! Approximates the Normalized Information Distance (NID) using a compressor `C`.
@@ -94,6 +119,11 @@
 //! configured rate backend.
 //!
 //! `ID(X) = (H₀(X) - Ĥ(X)) / H₀(X)`
+//!
+//! The bitwise framing `try_intrinsic_dependence_bits` uses the pooled binary
+//! baseline `H₀,bits` and `Ĥ_per_bit = Ĥ_bytes / 8`. It is **not** a rescaling
+//! of `ID_bytes`; on byte-aligned data it can attribute intra-byte structure
+//! (e.g. ASCII MSB framing) as dependence relative to a memoryless bit model.
 //!
 //! ### 7. Resistance to Transformation
 //! Quantifies how much information is preserved after a transformation `T` is applied.
@@ -161,8 +191,8 @@ pub mod tuner;
 use crate::api::CompiledRateBackend;
 #[cfg(all(test, feature = "all-backends"))]
 pub(crate) use crate::api::{
-    CalibratedSpec, CalibrationContextKind, MixtureExpertSpec, MixtureKind, MixtureSpec,
-    ParticleSpec,
+    CalibratedSpec, CalibrationContextKind, CalibrationTrainingMode, MixtureExpertSpec,
+    MixtureKind, MixtureSpec, ParticleSpec,
 };
 #[cfg(all(test, feature = "all-backends"))]
 use crate::api::{
@@ -177,6 +207,9 @@ use crate::api::{
     empirical_entropy_bytes, empirical_joint_entropy_bytes, js_div_bytes, nhd_bytes, tvd_bytes,
 };
 use crate::error::{InfotheoryError, InfotheoryResult};
+#[cfg(feature = "backend-bit-reservoir")]
+/// Bit-native reservoir rate backend.
+pub use backends::bit_reservoir;
 /// CTW and FAC-CTW backend types.
 #[cfg(feature = "backend-ctw")]
 pub use backends::ctw;
@@ -455,8 +488,7 @@ pub(crate) fn try_prequential_rate_backend(
     }
     let mut bits = 0.0;
     for &b in data {
-        bits -= predictor.log_prob(b) / std::f64::consts::LN_2;
-        predictor.update(b);
+        bits -= predictor.log_prob_update(b) / std::f64::consts::LN_2;
     }
     predictor.finish_stream().map_err(|e| {
         InfotheoryError::runtime(format!("rate backend stream finalize failed: {e}"))
@@ -550,7 +582,7 @@ pub(crate) fn try_frozen_plugin_rate_backend(
         })?;
     let mut bits = 0.0;
     for &byte in score_data {
-        bits -= predictor.log_prob(byte) / std::f64::consts::LN_2;
+        bits -= predictor.log_prob_frozen(byte) / std::f64::consts::LN_2;
         predictor.update_frozen(byte);
     }
     predictor.finish_stream().map_err(|e| {
@@ -692,6 +724,8 @@ mod tests {
                 bins: 16,
                 learning_rate: 0.05,
                 bias_clip: 4.0,
+                blend: 1.0,
+                training_mode: CalibrationTrainingMode::Nearest,
             }),
         }
     }
@@ -1396,11 +1430,13 @@ mod tests {
         feature = "backend-rosa",
         feature = "backend-ctw",
         feature = "backend-match",
+        feature = "backend-context",
         feature = "backend-ppmd",
         feature = "backend-sequitur",
         feature = "backend-mixture",
         feature = "backend-particle",
         feature = "backend-calibrated",
+        feature = "backend-bit-reservoir",
         feature = "backend-rwkv",
         feature = "backend-mamba"
     ))

@@ -1,6 +1,7 @@
 #[cfg(any(
     feature = "backend-rosa",
     feature = "backend-match",
+    feature = "backend-context",
     feature = "backend-ppmd",
     feature = "backend-sequitur",
     feature = "backend-ctw",
@@ -8,6 +9,7 @@
     feature = "backend-mixture",
     feature = "backend-particle",
     feature = "backend-calibrated",
+    feature = "backend-bit-reservoir",
     feature = "backend-mamba",
     feature = "backend-rwkv"
 ))]
@@ -96,6 +98,34 @@ feature_gated_rate_pdf_predictor_builder! {
 }
 
 feature_gated_rate_pdf_predictor_builder! {
+    feature: "backend-context",
+    fn build_pdf_predictor_order_ngram(backend) {
+        expect_plan_ref!(
+            backend.plan(),
+            crate::spec::core::RateBackendPlan::OrderNGram { order, hash_bits },
+            "order-ngram kernel used with non-order-ngram plan"
+        );
+        Ok(crate::compression::RatePdfPredictor::OrderNGram {
+            model: OrderNGramModel::new(*order, *hash_bits).map_err(anyhow::Error::msg)?,
+        })
+    }
+}
+
+feature_gated_rate_pdf_predictor_builder! {
+    feature: "backend-context",
+    fn build_pdf_predictor_word_context(backend) {
+        expect_plan_ref!(
+            backend.plan(),
+            crate::spec::core::RateBackendPlan::WordContext { hash_bits },
+            "word-context kernel used with non-word-context plan"
+        );
+        Ok(crate::compression::RatePdfPredictor::WordContext {
+            model: WordContextModel::new(*hash_bits).map_err(anyhow::Error::msg)?,
+        })
+    }
+}
+
+feature_gated_rate_pdf_predictor_builder! {
     feature: "backend-ppmd",
     fn build_pdf_predictor_ppmd(backend) {
         expect_plan_ref!(
@@ -157,6 +187,24 @@ feature_gated_rate_pdf_predictor_builder! {
                 Some(*msb_first),
             ),
         ))
+    }
+}
+
+feature_gated_rate_pdf_predictor_builder! {
+    feature: "backend-bit-reservoir",
+    fn build_pdf_predictor_bit_reservoir(backend) {
+        expect_plan_ref!(
+            backend.plan(),
+            crate::spec::core::RateBackendPlan::BitReservoir { config },
+            "bit-reservoir kernel used with non-bit-reservoir plan"
+        );
+        Ok(crate::compression::RatePdfPredictor::BitReservoir {
+            model: BitReservoirModel::new(config.clone()).map_err(anyhow::Error::msg)?,
+            pdf: vec![1.0 / 256.0; 256],
+            valid: false,
+            native_prefix_progress: None,
+            native_prediction: None,
+        })
     }
 }
 
@@ -232,9 +280,11 @@ feature_gated_rate_pdf_predictor_builder! {
             backend.plan(),
             crate::spec::core::RateBackendPlan::Calibrated {
                 context,
+                training_mode,
                 bins,
                 learning_rate,
                 bias_clip,
+                blend,
                 base,
             },
             "calibrated kernel used with non-calibrated plan"
@@ -243,7 +293,14 @@ feature_gated_rate_pdf_predictor_builder! {
             compile_calibrated_base_backend(base).map_err(|err| anyhow::anyhow!("{err}"))?;
         Ok(crate::compression::RatePdfPredictor::Calibrated {
             base: Box::new(build_rate_pdf_predictor_via_kernel(&base_backend)?),
-            core: CalibratorCore::new(*context, *bins, *learning_rate, *bias_clip),
+            core: CalibratorCore::new_configured(
+                *context,
+                *bins,
+                *learning_rate,
+                *bias_clip,
+                *blend,
+                *training_mode,
+            ),
             bitwise: Default::default(),
             pdf: vec![1.0 / 256.0; 256],
             valid: false,

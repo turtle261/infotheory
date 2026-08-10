@@ -3,9 +3,9 @@
 use super::compression::{NcdVariant, try_ncd_bytes_backend};
 use super::generation::{GenerationRng, pick_generated_byte, try_generate_rate_backend_chain};
 use super::metrics::{
-    empirical_entropy_bytes, try_biased_entropy_rate_backend, try_cross_entropy_rate_backend,
-    try_entropy_rate_backend, try_joint_entropy_rate_backend, try_mutual_information_rate_backend,
-    try_ned_rate_backend, try_nte_rate_backend,
+    empirical_entropy_bits, empirical_entropy_bytes, try_biased_entropy_rate_backend,
+    try_cross_entropy_rate_backend, try_entropy_rate_backend, try_joint_entropy_rate_backend,
+    try_mutual_information_rate_backend, try_ned_rate_backend, try_nte_rate_backend,
 };
 use super::types::{CompressionBackend, GenerationConfig, GenerationUpdateMode, RateBackend};
 use crate::aligned_prefix;
@@ -328,7 +328,12 @@ impl RateBackendBitSession {
                 }
 
                 let mut logps = [0.0f64; 256];
-                self.predictor.fill_log_probs(&mut logps);
+                match update_mode.unwrap_or(BufferedByteUpdateMode::Adaptive) {
+                    BufferedByteUpdateMode::Adaptive => self.predictor.fill_log_probs(&mut logps),
+                    BufferedByteUpdateMode::Frozen => {
+                        self.predictor.fill_log_probs_frozen(&mut logps);
+                    }
+                }
 
                 let mut mass = BytePrefixMass::from_log_probs(&logps, BitOrder::MsbFirst);
                 for bit_idx in 0..bits {
@@ -453,7 +458,7 @@ impl RateBackendBitSession {
                         )
                     });
                 }
-                self.ensure_mass_prefix(order);
+                self.ensure_mass_prefix(order, BufferedByteUpdateMode::Adaptive);
                 let native_bits = match &self.prefix.as_ref().expect("prefix initialized").kind {
                     BufferedBytePrefixKind::Mass(mass) => return mass.prediction(),
                     BufferedBytePrefixKind::NativeMsb { bits, .. } => *bits,
@@ -495,7 +500,7 @@ impl RateBackendBitSession {
         }
     }
 
-    #[cfg(any(feature = "aixi", test))]
+    #[cfg(any(feature = "aixi", all(test, feature = "backend-ctw")))]
     pub(crate) fn begin_discardable_scope(&mut self) {
         self.discardable_scopes = self.discardable_scopes.saturating_add(1);
     }
@@ -703,7 +708,7 @@ impl RateBackendBitSession {
                 Err(err) => return Err(InfotheoryError::runtime(err)),
             }
         }
-        self.ensure_mass_prefix(order);
+        self.ensure_mass_prefix(order, update_mode);
         Ok(())
     }
 
@@ -736,12 +741,15 @@ impl RateBackendBitSession {
         }
     }
 
-    fn ensure_mass_prefix(&mut self, order: BitOrder) {
+    fn ensure_mass_prefix(&mut self, order: BitOrder, update_mode: BufferedByteUpdateMode) {
         if self.prefix.is_some() {
             return;
         }
         let mut logps = [0.0f64; 256];
-        self.predictor.fill_log_probs(&mut logps);
+        match update_mode {
+            BufferedByteUpdateMode::Adaptive => self.predictor.fill_log_probs(&mut logps),
+            BufferedByteUpdateMode::Frozen => self.predictor.fill_log_probs_frozen(&mut logps),
+        }
         self.prefix = Some(BufferedBytePrefix::new_mass(
             BytePrefixMass::from_log_probs(&logps, order),
         ));
@@ -932,10 +940,20 @@ impl RateBackendSession {
                 #[cfg(feature = "backend-rosa")]
                 crate::mixture::RateBackendPredictor::Rosa { .. } => {
                     for (sym, slot) in logps.iter_mut().enumerate() {
-                        *slot = self.predictor.log_prob(sym as u8);
+                        *slot = match config.update_mode {
+                            GenerationUpdateMode::Adaptive => self.predictor.log_prob(sym as u8),
+                            GenerationUpdateMode::Frozen => {
+                                self.predictor.log_prob_frozen(sym as u8)
+                            }
+                        };
                     }
                 }
-                _ => self.predictor.fill_log_probs(&mut logps),
+                _ => match config.update_mode {
+                    GenerationUpdateMode::Adaptive => self.predictor.fill_log_probs(&mut logps),
+                    GenerationUpdateMode::Frozen => {
+                        self.predictor.fill_log_probs_frozen(&mut logps);
+                    }
+                },
             }
             let byte = pick_generated_byte(&logps, config, &mut rng);
             match config.update_mode {
@@ -1183,6 +1201,23 @@ impl InfotheoryCtx {
         }
         let h_rate = self.try_entropy_rate_bytes(data)?;
         Ok(((h_empirical - h_rate) / h_empirical).clamp(0.0, 1.0))
+    }
+
+    /// Bitwise intrinsic dependence in `[0,1]`:
+    /// `(H₀,bits(X) - Ĥ_per_bit(X)) / H₀,bits(X)`.
+    ///
+    /// Uses the pooled binary-alphabet empirical entropy as the IID baseline and
+    /// the context rate backend expressed in bits-per-bit (`Ĥ_bytes / 8`). This
+    /// is **not** `try_intrinsic_dependence_bytes / 8`: the baseline alphabet
+    /// changes, so values differ (and can attribute intra-byte framing as
+    /// "dependence" relative to a memoryless bit model).
+    pub fn try_intrinsic_dependence_bits(&self, data: &[u8]) -> InfotheoryResult<f64> {
+        let h_empirical = empirical_entropy_bits(data);
+        if h_empirical < 1e-9 {
+            return Ok(0.0);
+        }
+        let h_rate_per_bit = self.try_entropy_rate_bytes(data)? / 8.0;
+        Ok(((h_empirical - h_rate_per_bit) / h_empirical).clamp(0.0, 1.0))
     }
 
     /// Resistance-to-transformation ratio `I(X;T(X))/H(X)` in `[0,1]` under this context's rate backend.
@@ -1645,12 +1680,12 @@ mod tests {
         assert_eq!(ctw_checkpoint_depth(&session), 1);
     }
 
-    /// When static native MSB support is advertised but dynamic begin negotiation
-    /// returns `Ok(false)` (e.g. mixture expert lacks checkpoint rollback), `predict_bit`
-    /// must fall back to the BytePrefixMass path without debug-only false positives.
+    /// When static native MSB support is advertised without the empty-abort
+    /// capability needed by mixture setup rollback, `predict_bit` must fall back
+    /// to the BytePrefixMass path without debug-only false positives.
     #[cfg(feature = "backend-mixture")]
     #[test]
-    fn predict_bit_mass_fallback_when_native_begin_returns_false() {
+    fn predict_bit_mass_fallback_when_native_setup_is_not_abortable() {
         use crate::mixture::{
             BayesMixture, DEFAULT_MIN_PROB, ExpertConfig, MixtureRuntime, RateBackendPredictor,
         };

@@ -30,10 +30,12 @@ pub use self::document::{
     TuneSpec, ValidatedTuneSpec, WarmStartExactJhTuneControllerSpec,
 };
 
+#[cfg(feature = "backend-bit-reservoir")]
+use crate::api::BitReservoirConfig;
 use crate::api::{
-    CalibratedSpec, CalibrationContextKind, CompressionBackend, MAX_MIXTURE_NESTING,
-    MixtureExpertSpec, MixtureKind, MixtureScheduleMode, MixtureSpec, ParticleSpec, RateBackend,
-    parse_mixture_kind_name, parse_mixture_schedule_name,
+    CalibratedSpec, CalibrationContextKind, CalibrationTrainingMode, CompressionBackend,
+    MAX_MIXTURE_NESTING, MixtureExpertSpec, MixtureKind, MixtureScheduleMode, MixtureSpec,
+    ParticleSpec, RateBackend, parse_mixture_kind_name, parse_mixture_schedule_name,
 };
 use crate::validate_zpaq_rate_method;
 use std::error::Error;
@@ -330,11 +332,27 @@ fn parse_calibration_context_kind(value: Option<&str>) -> SpecResult<Calibration
     match value.unwrap_or("text").trim().to_ascii_lowercase().as_str() {
         "global" => Ok(CalibrationContextKind::Global),
         "byteclass" => Ok(CalibrationContextKind::ByteClass),
+        "order1" | "order-1" | "byte" => Ok(CalibrationContextKind::Order1),
         "text" => Ok(CalibrationContextKind::Text),
         "repeat" => Ok(CalibrationContextKind::Repeat),
         "textrepeat" => Ok(CalibrationContextKind::TextRepeat),
         other => Err(SpecError::new(format!(
             "unknown calibration context '{other}'"
+        ))),
+    }
+}
+
+fn parse_calibration_training_mode(value: Option<&str>) -> SpecResult<CalibrationTrainingMode> {
+    match value
+        .unwrap_or("nearest")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "nearest" => Ok(CalibrationTrainingMode::Nearest),
+        "interpolated" => Ok(CalibrationTrainingMode::Interpolated),
+        other => Err(SpecError::new(format!(
+            "unknown calibration training mode '{other}'"
         ))),
     }
 }
@@ -368,6 +386,7 @@ fn mixture_kind_name(kind: MixtureKind) -> &'static str {
         MixtureKind::Convex => "convex",
         MixtureKind::Mdl => "mdl",
         MixtureKind::Neural => "neural",
+        MixtureKind::Logistic => "logistic",
     }
 }
 
@@ -382,9 +401,17 @@ fn calibration_context_kind_name(kind: CalibrationContextKind) -> &'static str {
     match kind {
         CalibrationContextKind::Global => "global",
         CalibrationContextKind::ByteClass => "byteclass",
+        CalibrationContextKind::Order1 => "order1",
         CalibrationContextKind::Text => "text",
         CalibrationContextKind::Repeat => "repeat",
         CalibrationContextKind::TextRepeat => "textrepeat",
+    }
+}
+
+fn calibration_training_mode_name(kind: CalibrationTrainingMode) -> &'static str {
+    match kind {
+        CalibrationTrainingMode::Nearest => "nearest",
+        CalibrationTrainingMode::Interpolated => "interpolated",
     }
 }
 
@@ -967,12 +994,18 @@ pub fn mixture_spec_to_json_value(spec: &MixtureSpec) -> SpecResult<serde_json::
 
 /// Serialize a `CalibratedSpec` into the canonical JSON representation.
 pub fn calibrated_spec_to_json_value(spec: &CalibratedSpec) -> SpecResult<serde_json::Value> {
+    // `serde_json::json!` turns non-finite floats into `null`; validate before
+    // constructing the value so invalid typed input cannot silently become the
+    // legacy default on a later parse round trip.
+    crate::api::types::validate_calibrated_blend(spec.blend).map_err(SpecError::new)?;
     Ok(serde_json::json!({
         "base": rate_backend_to_json_value(&spec.base)?,
         "context": calibration_context_kind_name(spec.context),
         "bins": spec.bins,
         "learning_rate": spec.learning_rate,
         "bias_clip": spec.bias_clip,
+        "blend": spec.blend,
+        "training_mode": calibration_training_mode_name(spec.training_mode),
     }))
 }
 
@@ -1017,6 +1050,15 @@ fn rate_backend_to_json_leaf_value(
             "base_mix": base_mix,
             "confidence_scale": confidence_scale,
         }))),
+        RateBackend::OrderNGram { order, hash_bits } => Some(Ok(serde_json::json!({
+            "kind": canonical,
+            "order": order,
+            "hash_bits": hash_bits,
+        }))),
+        RateBackend::WordContext { hash_bits } => Some(Ok(serde_json::json!({
+            "kind": canonical,
+            "hash_bits": hash_bits,
+        }))),
         RateBackend::Ppmd { order, memory_mb } => Some(Ok(serde_json::json!({
             "kind": canonical,
             "order": order,
@@ -1030,6 +1072,10 @@ fn rate_backend_to_json_leaf_value(
             "kind": canonical,
             "method": zpaq_method_to_json_value(method),
         }))),
+        #[cfg(feature = "backend-bit-reservoir")]
+        RateBackend::BitReservoir { config } => {
+            Some(Ok(bit_reservoir_config_to_json_value(canonical, config)))
+        }
         RateBackend::Ctw { depth } => Some(Ok(serde_json::json!({
             "kind": canonical,
             "depth": depth,
@@ -1140,6 +1186,7 @@ pub fn parse_particle_spec_value(v: &serde_json::Value) -> SpecResult<ParticleSp
                 | "switching"
                 | "mdl"
                 | "neural"
+                | "logistic"
                 | "mixture"
         ) {
             return Err(SpecError::new(format!(
@@ -1200,6 +1247,186 @@ pub fn parse_particle_spec_value(v: &serde_json::Value) -> SpecResult<ParticleSp
         min_prob: v["min_prob"].as_f64().unwrap_or(d.min_prob),
         seed: v["seed"].as_u64().unwrap_or(d.seed),
     })
+}
+
+#[cfg(feature = "backend-bit-reservoir")]
+fn bit_reservoir_config_to_json_value(
+    canonical: &str,
+    config: &BitReservoirConfig,
+) -> serde_json::Value {
+    serde_json::json!({
+        "kind": canonical,
+        "hidden": config.hidden,
+        "delay_bits": config.delay_bits,
+        "embedding_bits": config.embedding_bits,
+        "learning_rate": config.learning_rate,
+        "learning_rate_decay": config.learning_rate_decay,
+        "weight_decay": config.weight_decay,
+        "state_decay": config.state_decay,
+        "recurrent_scale": config.recurrent_scale,
+        "input_scale": config.input_scale,
+        "phase_scale": config.phase_scale,
+        "grad_clip": config.grad_clip,
+        "seed": config.seed,
+    })
+}
+
+#[cfg(feature = "backend-bit-reservoir")]
+fn json_usize_field(object: &serde_json::Value, field: &str, default: usize) -> SpecResult<usize> {
+    match object.get(field).filter(|value| !value.is_null()) {
+        Some(value) => value
+            .as_u64()
+            .and_then(|raw| usize::try_from(raw).ok())
+            .ok_or_else(|| SpecError::new(format!("bit-reservoir {field} must be an integer"))),
+        None => Ok(default),
+    }
+}
+
+#[cfg(feature = "backend-bit-reservoir")]
+fn json_f64_field(object: &serde_json::Value, field: &str, default: f64) -> SpecResult<f64> {
+    match object.get(field).filter(|value| !value.is_null()) {
+        Some(value) => value
+            .as_f64()
+            .ok_or_else(|| SpecError::new(format!("bit-reservoir {field} must be numeric"))),
+        None => Ok(default),
+    }
+}
+
+#[cfg(feature = "backend-bit-reservoir")]
+fn json_u64_field(object: &serde_json::Value, field: &str, default: u64) -> SpecResult<u64> {
+    match object.get(field).filter(|value| !value.is_null()) {
+        Some(value) => value
+            .as_u64()
+            .ok_or_else(|| SpecError::new(format!("bit-reservoir {field} must be an integer"))),
+        None => Ok(default),
+    }
+}
+
+#[cfg(feature = "backend-bit-reservoir")]
+fn parse_bit_reservoir_config_value(v: &serde_json::Value) -> SpecResult<BitReservoirConfig> {
+    let defaults = BitReservoirConfig::default();
+    let config = BitReservoirConfig {
+        hidden: json_usize_field(v, "hidden", defaults.hidden)?,
+        delay_bits: json_usize_field(v, "delay_bits", defaults.delay_bits)?,
+        embedding_bits: json_usize_field(v, "embedding_bits", defaults.embedding_bits)?,
+        learning_rate: json_f64_field(v, "learning_rate", defaults.learning_rate)?,
+        learning_rate_decay: json_f64_field(
+            v,
+            "learning_rate_decay",
+            defaults.learning_rate_decay,
+        )?,
+        weight_decay: json_f64_field(v, "weight_decay", defaults.weight_decay)?,
+        state_decay: json_f64_field(v, "state_decay", defaults.state_decay)?,
+        recurrent_scale: json_f64_field(v, "recurrent_scale", defaults.recurrent_scale)?,
+        input_scale: json_f64_field(v, "input_scale", defaults.input_scale)?,
+        phase_scale: json_f64_field(v, "phase_scale", defaults.phase_scale)?,
+        grad_clip: json_f64_field(v, "grad_clip", defaults.grad_clip)?,
+        seed: json_u64_field(v, "seed", defaults.seed)?,
+    };
+    config
+        .validate()
+        .map_err(|err| SpecError::new(err.to_string()))?;
+    Ok(config)
+}
+
+#[cfg(feature = "backend-bit-reservoir")]
+fn parse_bit_reservoir_shorthand_method(method: Option<&str>) -> SpecResult<RateBackend> {
+    let mut config = BitReservoirConfig::default();
+    let Some(method) = method else {
+        return Ok(RateBackend::BitReservoir { config });
+    };
+    if let Ok(hidden) = method.parse::<usize>() {
+        config.hidden = hidden;
+        config
+            .validate()
+            .map_err(|err| SpecError::new(err.to_string()))?;
+        return Ok(RateBackend::BitReservoir { config });
+    }
+
+    for raw_pair in method.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let Some((key, value)) = raw_pair.split_once('=') else {
+            return Err(SpecError::new(format!(
+                "bit-reservoir shorthand option '{raw_pair}' must be key=value"
+            )));
+        };
+        let key = key.trim();
+        let value = value.trim();
+        match key {
+            "hidden" | "h" => {
+                config.hidden = value.parse::<usize>().map_err(|_| {
+                    SpecError::new("bit-reservoir hidden shorthand value must be an integer")
+                })?;
+            }
+            "delay_bits" | "delay" | "d" => {
+                config.delay_bits = value.parse::<usize>().map_err(|_| {
+                    SpecError::new("bit-reservoir delay_bits shorthand value must be an integer")
+                })?;
+            }
+            "embedding_bits" | "embed_bits" | "eb" => {
+                config.embedding_bits = value.parse::<usize>().map_err(|_| {
+                    SpecError::new(
+                        "bit-reservoir embedding_bits shorthand value must be an integer",
+                    )
+                })?;
+            }
+            "learning_rate" | "lr" => {
+                config.learning_rate = value.parse::<f64>().map_err(|_| {
+                    SpecError::new("bit-reservoir learning_rate shorthand value must be numeric")
+                })?;
+            }
+            "learning_rate_decay" | "lr_decay" => {
+                config.learning_rate_decay = value.parse::<f64>().map_err(|_| {
+                    SpecError::new(
+                        "bit-reservoir learning_rate_decay shorthand value must be numeric",
+                    )
+                })?;
+            }
+            "weight_decay" | "wd" => {
+                config.weight_decay = value.parse::<f64>().map_err(|_| {
+                    SpecError::new("bit-reservoir weight_decay shorthand value must be numeric")
+                })?;
+            }
+            "state_decay" => {
+                config.state_decay = value.parse::<f64>().map_err(|_| {
+                    SpecError::new("bit-reservoir state_decay shorthand value must be numeric")
+                })?;
+            }
+            "recurrent_scale" | "rec" => {
+                config.recurrent_scale = value.parse::<f64>().map_err(|_| {
+                    SpecError::new("bit-reservoir recurrent_scale shorthand value must be numeric")
+                })?;
+            }
+            "input_scale" | "input" => {
+                config.input_scale = value.parse::<f64>().map_err(|_| {
+                    SpecError::new("bit-reservoir input_scale shorthand value must be numeric")
+                })?;
+            }
+            "phase_scale" | "phase" => {
+                config.phase_scale = value.parse::<f64>().map_err(|_| {
+                    SpecError::new("bit-reservoir phase_scale shorthand value must be numeric")
+                })?;
+            }
+            "grad_clip" | "clip" => {
+                config.grad_clip = value.parse::<f64>().map_err(|_| {
+                    SpecError::new("bit-reservoir grad_clip shorthand value must be numeric")
+                })?;
+            }
+            "seed" => {
+                config.seed = value.parse::<u64>().map_err(|_| {
+                    SpecError::new("bit-reservoir seed shorthand value must be an integer")
+                })?;
+            }
+            other => {
+                return Err(SpecError::new(format!(
+                    "unknown bit-reservoir shorthand option '{other}'"
+                )));
+            }
+        }
+    }
+    config
+        .validate()
+        .map_err(|err| SpecError::new(err.to_string()))?;
+    Ok(RateBackend::BitReservoir { config })
 }
 
 /// Parse a canonical rate-backend JSON object.
@@ -1395,6 +1622,22 @@ fn parse_rate_backend_json_leaf(
                 .as_f64()
                 .unwrap_or(crate::rate_defaults::JSON_DEFAULT_SPARSE_MATCH_CONFIDENCE_SCALE),
         },
+        crate::runtime::RateBackendKind::OrderNGram => RateBackend::OrderNGram {
+            order: v["order"]
+                .as_u64()
+                .unwrap_or(crate::rate_defaults::JSON_DEFAULT_ORDER_NGRAM_ORDER as u64)
+                as usize,
+            hash_bits: v["hash_bits"]
+                .as_u64()
+                .unwrap_or(crate::rate_defaults::JSON_DEFAULT_ORDER_NGRAM_HASH_BITS as u64)
+                as usize,
+        },
+        crate::runtime::RateBackendKind::WordContext => RateBackend::WordContext {
+            hash_bits: v["hash_bits"]
+                .as_u64()
+                .unwrap_or(crate::rate_defaults::JSON_DEFAULT_WORD_CONTEXT_HASH_BITS as u64)
+                as usize,
+        },
         crate::runtime::RateBackendKind::Ppmd => RateBackend::Ppmd {
             order: v["order"]
                 .as_u64()
@@ -1419,6 +1662,20 @@ fn parse_rate_backend_json_leaf(
             validate_zpaq_rate_method(method.value())
                 .map_err(|err| SpecError::new(err.to_string()))?;
             RateBackend::Zpaq { method }
+        }
+        crate::runtime::RateBackendKind::BitReservoir => {
+            #[cfg(feature = "backend-bit-reservoir")]
+            {
+                RateBackend::BitReservoir {
+                    config: parse_bit_reservoir_config_value(v)?,
+                }
+            }
+            #[cfg(not(feature = "backend-bit-reservoir"))]
+            {
+                return Err(SpecError::new(
+                    "bit-reservoir backend disabled at compile time",
+                ));
+            }
         }
         _ => return Ok(None),
     };
@@ -1550,12 +1807,31 @@ pub fn parse_calibrated_spec_value(
         ));
     };
 
+    let blend = match v.get("blend") {
+        Some(value) => value
+            .as_f64()
+            .ok_or_else(|| SpecError::new("calibrated blend must be a JSON number"))?,
+        // Omitted blend is the documented legacy/default full-calibration
+        // behavior. An explicit `null` is not equivalent to omission.
+        None => 1.0,
+    };
+    crate::api::types::validate_calibrated_blend(blend).map_err(SpecError::new)?;
+
     Ok(CalibratedSpec {
         base: base_backend,
         context: parse_calibration_context_kind(v["context"].as_str())?,
         bins: v["bins"].as_u64().unwrap_or(32) as usize,
         learning_rate: v["learning_rate"].as_f64().unwrap_or(1.0 / 32.0),
         bias_clip: v["bias_clip"].as_f64().unwrap_or(16.0),
+        blend,
+        training_mode: match v.get("training_mode") {
+            Some(value) => {
+                parse_calibration_training_mode(Some(value.as_str().ok_or_else(|| {
+                    SpecError::new("calibrated training_mode must be a JSON string")
+                })?))?
+            }
+            None => CalibrationTrainingMode::Nearest,
+        },
     })
 }
 
@@ -1860,6 +2136,17 @@ fn parse_rate_backend_name_method_leaf(
             base_mix: crate::rate_defaults::JSON_DEFAULT_SPARSE_MATCH_BASE_MIX,
             confidence_scale: crate::rate_defaults::JSON_DEFAULT_SPARSE_MATCH_CONFIDENCE_SCALE,
         },
+        crate::runtime::RateBackendKind::OrderNGram => RateBackend::OrderNGram {
+            order: method
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(crate::rate_defaults::JSON_DEFAULT_ORDER_NGRAM_ORDER),
+            hash_bits: crate::rate_defaults::JSON_DEFAULT_ORDER_NGRAM_HASH_BITS,
+        },
+        crate::runtime::RateBackendKind::WordContext => RateBackend::WordContext {
+            hash_bits: method
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(crate::rate_defaults::JSON_DEFAULT_WORD_CONTEXT_HASH_BITS),
+        },
         crate::runtime::RateBackendKind::Ppmd => RateBackend::Ppmd {
             order: method
                 .and_then(|value| value.parse::<usize>().ok())
@@ -1894,6 +2181,18 @@ fn parse_rate_backend_name_method_leaf(
             validate_zpaq_rate_method(&method).map_err(|err| SpecError::new(err.to_string()))?;
             RateBackend::Zpaq {
                 method: crate::api::ZpaqMethodSpec::literal(method),
+            }
+        }
+        crate::runtime::RateBackendKind::BitReservoir => {
+            #[cfg(feature = "backend-bit-reservoir")]
+            {
+                parse_bit_reservoir_shorthand_method(method)?
+            }
+            #[cfg(not(feature = "backend-bit-reservoir"))]
+            {
+                return Err(SpecError::new(
+                    "bit-reservoir backend disabled at compile time",
+                ));
             }
         }
         _ => return Ok(None),
@@ -2143,6 +2442,8 @@ mod tests {
                                 bins: 17,
                                 learning_rate: 0.05,
                                 bias_clip: 3.0,
+                                blend: 1.0,
+                                training_mode: CalibrationTrainingMode::Nearest,
                             }),
                         });
                     }
@@ -2258,6 +2559,61 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "all-backends")]
+    #[test]
+    fn calibrated_blend_rejects_nonfinite_typed_and_null_json_values() {
+        let valid = CalibratedSpec::new(
+            RateBackend::RosaPlus { max_order: -1 },
+            CalibrationContextKind::Global,
+        );
+        let invalid_typed = valid.clone().with_blend(f64::NAN);
+        let err = calibrated_spec_to_json_value(&invalid_typed)
+            .expect_err("non-finite blend must not serialize as a different JSON value");
+        assert!(err.to_string().contains("blend"), "unexpected error: {err}");
+
+        let mut explicit_null = calibrated_spec_to_json_value(&valid).expect("valid spec JSON");
+        explicit_null["blend"] = serde_json::Value::Null;
+        let err = match parse_calibrated_spec_value(
+            &explicit_null,
+            Path::new("."),
+            MAX_MIXTURE_NESTING,
+        ) {
+            Ok(_) => panic!("explicit null blend must not mean the legacy default"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("blend"), "unexpected error: {err}");
+
+        let omitted_blend = {
+            let mut value = explicit_null;
+            value
+                .as_object_mut()
+                .expect("calibrated JSON object")
+                .remove("blend");
+            value
+        };
+        let parsed =
+            parse_calibrated_spec_value(&omitted_blend, Path::new("."), MAX_MIXTURE_NESTING)
+                .expect("omitted blend retains documented legacy default");
+        assert_eq!(parsed.blend, 1.0);
+        assert_eq!(parsed.training_mode, CalibrationTrainingMode::Nearest);
+
+        let mut explicit_null_mode =
+            calibrated_spec_to_json_value(&valid).expect("valid spec JSON");
+        explicit_null_mode["training_mode"] = serde_json::Value::Null;
+        let err = match parse_calibrated_spec_value(
+            &explicit_null_mode,
+            Path::new("."),
+            MAX_MIXTURE_NESTING,
+        ) {
+            Ok(_) => panic!("explicit null training mode must not mean the legacy default"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("training_mode"),
+            "unexpected error: {err}"
+        );
+    }
+
     #[test]
     fn enabled_compression_parse_paths_validate_and_roundtrip() {
         for backend in sample_roundtrip_compression_backends() {
@@ -2318,6 +2674,8 @@ mod tests {
                 bins: 31,
                 learning_rate: 0.05,
                 bias_clip: 3.0,
+                blend: 1.0,
+                training_mode: CalibrationTrainingMode::Nearest,
             }),
         };
 
@@ -2738,17 +3096,36 @@ mod tests {
             parse_calibration_context_kind(Some("repeat")).expect("repeat context"),
             CalibrationContextKind::Repeat
         );
+        assert_eq!(
+            parse_calibration_context_kind(Some("order-1")).expect("order-1 context"),
+            CalibrationContextKind::Order1
+        );
         assert!(parse_calibration_context_kind(Some("legacy")).is_err());
+        assert_eq!(
+            parse_calibration_training_mode(None).expect("default training mode"),
+            CalibrationTrainingMode::Nearest
+        );
+        assert_eq!(
+            parse_calibration_training_mode(Some("interpolated"))
+                .expect("interpolated training mode"),
+            CalibrationTrainingMode::Interpolated
+        );
+        assert!(parse_calibration_training_mode(Some("legacy")).is_err());
 
         assert_eq!(
             parse_mixture_kind("switching").expect("switching"),
             MixtureKind::Switching
         );
         assert_eq!(
+            parse_mixture_kind("logistic").expect("logistic"),
+            MixtureKind::Logistic
+        );
+        assert_eq!(
             parse_mixture_schedule("theorem").expect("theorem schedule"),
             MixtureScheduleMode::Theorem
         );
         assert_eq!(mixture_kind_name(MixtureKind::Neural), "neural");
+        assert_eq!(mixture_kind_name(MixtureKind::Logistic), "logistic");
         assert_eq!(
             mixture_schedule_name(MixtureScheduleMode::Default),
             "default"
@@ -2756,6 +3133,14 @@ mod tests {
         assert_eq!(
             calibration_context_kind_name(CalibrationContextKind::Text),
             "text"
+        );
+        assert_eq!(
+            calibration_context_kind_name(CalibrationContextKind::Order1),
+            "order1"
+        );
+        assert_eq!(
+            calibration_training_mode_name(CalibrationTrainingMode::Nearest),
+            "nearest"
         );
 
         assert_eq!(
@@ -2835,6 +3220,8 @@ mod tests {
             bins: 17,
             learning_rate: 0.05,
             bias_clip: 3.0,
+            blend: 1.0,
+            training_mode: CalibrationTrainingMode::Nearest,
         };
         let particle = ParticleSpec::default();
 
@@ -3308,6 +3695,28 @@ mod tests {
             _ => panic!("expected sparse-match backend"),
         }
 
+        let ngram = parse_rate_backend_name_method("ngram", Some("3"), &options)
+            .expect("ngram shorthand should parse");
+        match ngram {
+            RateBackend::OrderNGram { order, hash_bits } => {
+                assert_eq!(order, 3);
+                assert_eq!(
+                    hash_bits,
+                    crate::rate_defaults::JSON_DEFAULT_ORDER_NGRAM_HASH_BITS
+                );
+            }
+            _ => panic!("expected order-ngram backend"),
+        }
+
+        let word = parse_rate_backend_name_method("word-context", Some("13"), &options)
+            .expect("word-context shorthand should parse");
+        match word {
+            RateBackend::WordContext { hash_bits } => {
+                assert_eq!(hash_bits, 13);
+            }
+            _ => panic!("expected word-context backend"),
+        }
+
         let fac_ctw = parse_rate_backend_name_method("fac-ctw", Some("11"), &options)
             .expect("fac-ctw shorthand should parse");
         match fac_ctw {
@@ -3404,6 +3813,8 @@ mod tests {
             bins: 21,
             learning_rate: 0.03,
             bias_clip: 2.5,
+            blend: 1.0,
+            training_mode: CalibrationTrainingMode::Nearest,
         };
         let mixture = MixtureSpec::new(
             MixtureKind::Bayes,
@@ -3479,6 +3890,7 @@ mod tests {
                 RateBackend::Calibrated { spec } => {
                     assert_eq!(spec.bins, 21);
                     assert_eq!(spec.context, CalibrationContextKind::Repeat);
+                    assert_eq!(spec.blend, 1.0);
                     match spec.base {
                         RateBackend::Ctw { depth } => assert_eq!(depth, 9),
                         _ => panic!("expected ctw base backend"),

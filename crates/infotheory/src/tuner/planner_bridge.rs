@@ -689,7 +689,7 @@ pub(super) fn validate_warmstart_teacher_contract(
     Ok(())
 }
 
-fn compile_planner_mutation_actions(
+pub(super) fn compile_planner_mutation_actions(
     baseline: crate::api::CompressionBackend,
     bounds: &crate::spec::TuneBoundsSpec,
 ) -> Result<Vec<PlannerMutationAction>, String> {
@@ -706,17 +706,14 @@ fn compile_planner_mutation_actions(
     }
     let mut actions = Vec::<PlannerMutationAction>::new();
     for leaf in leaves {
-        let deltas = match leaf.kind {
-            NumericKind::Unsigned | NumericKind::Signed => [-1.0, 1.0],
-            NumericKind::Float => [-0.05, 0.05],
-        };
-        for delta in deltas {
+        let range = range_map.get(&leaf.path).copied();
+        for delta in planner_numeric_deltas(leaf.kind, range) {
             actions.push(PlannerMutationAction::NumericStep {
                 path: leaf.path.clone(),
                 pointer: leaf.pointer.clone(),
                 kind: leaf.kind,
                 delta,
-                range: range_map.get(&leaf.path).copied(),
+                range,
             });
         }
     }
@@ -724,6 +721,56 @@ fn compile_planner_mutation_actions(
         actions.push(PlannerMutationAction::Noop);
     }
     Ok(actions)
+}
+
+fn planner_numeric_deltas(kind: NumericKind, range: Option<(f64, f64)>) -> Vec<f64> {
+    match kind {
+        NumericKind::Unsigned | NumericKind::Signed => {
+            let magnitudes = planner_integer_magnitudes(range);
+            let mut deltas = Vec::with_capacity(magnitudes.len().saturating_mul(2));
+            for magnitude in magnitudes {
+                let magnitude = magnitude as f64;
+                deltas.push(-magnitude);
+                deltas.push(magnitude);
+            }
+            deltas
+        }
+        NumericKind::Float => {
+            let fractions = [0.025_f64, 0.05_f64, 0.10_f64];
+            let mut deltas = Vec::with_capacity(fractions.len().saturating_mul(2));
+            for fraction in fractions {
+                deltas.push(-fraction);
+                deltas.push(fraction);
+            }
+            deltas
+        }
+    }
+}
+
+fn planner_integer_magnitudes(range: Option<(f64, f64)>) -> Vec<u64> {
+    const MAX_INTEGER_MAGNITUDE: u64 = 32;
+    let max_magnitude = range
+        .and_then(|(min, max)| {
+            let min = min.ceil();
+            let max = max.floor();
+            if !min.is_finite() || !max.is_finite() || max <= min {
+                return None;
+            }
+            Some((max - min) as u64)
+        })
+        .unwrap_or(1)
+        .min(MAX_INTEGER_MAGNITUDE)
+        .max(1);
+    let mut magnitudes = Vec::new();
+    let mut magnitude = 1_u64;
+    while magnitude <= max_magnitude {
+        magnitudes.push(magnitude);
+        match magnitude.checked_mul(2) {
+            Some(next) => magnitude = next,
+            None => break,
+        }
+    }
+    magnitudes
 }
 
 pub(super) fn apply_planner_mutation_action(

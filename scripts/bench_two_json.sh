@@ -10,6 +10,7 @@ BENCH_SUITE=${INFOTHEORY_BENCH_SUITE:-two-json}
 COMP_BACKEND=${INFOTHEORY_BENCH_COMPRESSION_BACKEND:-rate-ac}
 BENCH_FEATURES=${INFOTHEORY_BENCH_FEATURES:-cli}
 BENCH_BUILD_MODE=${INFOTHEORY_BENCH_BUILD_MODE:-${INFOTHEORY_BUILD_MODE:-native}}
+BENCH_OPERATIONS=${INFOTHEORY_BENCH_OPERATIONS:-"h compress decompress"}
 REPEATS=${INFOTHEORY_BENCH_REPEATS:-3}
 WARMUPS=${INFOTHEORY_BENCH_WARMUPS:-1}
 SIZES=${INFOTHEORY_BENCH_SIZES:-"4096 16384 65536 262144 1048576 2097152 4194304 10000000"}
@@ -33,14 +34,26 @@ case "${BENCH_SUITE}" in
     SUITE_DISPLAY="configs/bench/two.json"
     SUITE_PATH_PREFIX="infotheory-two-json"
     ;;
+  one-sse|one_sse|one)
+    BENCH_SUITE=one-sse
+    SUITE_SPEC_PATH="${ROOT_DIR}/configs/bench/one_sse.json"
+    SUITE_DISPLAY="configs/bench/one_sse.json"
+    SUITE_PATH_PREFIX="infotheory-one-sse"
+    ;;
   extra)
     BENCH_SUITE=extra
     SUITE_SPEC_PATH="${ROOT_DIR}/configs/bench/extra.json"
     SUITE_DISPLAY="configs/bench/extra.json"
     SUITE_PATH_PREFIX="infotheory-extra"
     ;;
+  three-json|three_json|three)
+    BENCH_SUITE=three-json
+    SUITE_SPEC_PATH="${ROOT_DIR}/configs/bench/three.json"
+    SUITE_DISPLAY="configs/bench/three.json"
+    SUITE_PATH_PREFIX="infotheory-three-json"
+    ;;
   *)
-    fail "INFOTHEORY_BENCH_SUITE must be 'two-json' or 'extra' (found '${BENCH_SUITE}')"
+    fail "INFOTHEORY_BENCH_SUITE must be 'two-json', 'one-sse', 'extra', or 'three-json' (found '${BENCH_SUITE}')"
     ;;
 esac
 
@@ -52,7 +65,86 @@ import sys
 print(Path(sys.argv[1]).resolve())
 PY
 )
-SUITE_SPEC_SHA256=$(sha256sum "${SUITE_SPEC_PATH}" | awk 'NR==1 { print $1 }')
+SUITE_SPEC_SHA256=$(python3 - "${SUITE_SPEC_PATH}" <<'PY'
+import hashlib
+import json
+from pathlib import Path
+import sys
+
+root = Path(sys.argv[1]).resolve(strict=True)
+root_dir = root.parent
+files = {}
+active = []
+active_set = set()
+
+
+def referenced_specs(value):
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if key == "spec_path" and isinstance(child, str):
+                yield child
+            yield from referenced_specs(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from referenced_specs(child)
+
+
+def visit(path):
+    path = path.resolve(strict=True)
+    if path in active_set:
+        cycle_start = active.index(path)
+        chain = " -> ".join(str(item) for item in (*active[cycle_start:], path))
+        raise ValueError(f"cyclic benchmark spec_path reference: {chain}")
+    if path in files:
+        return
+
+    raw = path.read_bytes()
+    try:
+        document = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"failed to parse referenced benchmark spec {path}: {error}") from error
+
+    active.append(path)
+    active_set.add(path)
+    files[path] = raw
+    references = set()
+    for reference in referenced_specs(document):
+        reference_path = Path(reference)
+        if not reference_path.is_absolute():
+            reference_path = path.parent / reference_path
+        references.add(reference_path.resolve())
+    for reference in sorted(references, key=lambda item: str(item)):
+        visit(reference)
+    active.pop()
+    active_set.remove(path)
+
+
+visit(root)
+
+# Preserve historical resume keys for self-contained suites. Referencing suites
+# use a framed closure digest so changing any transitively loaded definition,
+# including three_base.json, necessarily changes the key without ambiguous byte
+# concatenation or dependence on the repository's absolute location.
+if len(files) == 1:
+    digest = hashlib.sha256(files[root])
+else:
+    digest = hashlib.sha256(b"infotheory-benchmark-spec-closure-v1\0")
+    records = []
+    for path, raw in files.items():
+        try:
+            label = path.relative_to(root_dir).as_posix()
+        except ValueError:
+            label = str(path)
+        records.append((label.encode("utf-8"), raw))
+    for label, raw in sorted(records):
+        digest.update(len(label).to_bytes(8, "big"))
+        digest.update(label)
+        digest.update(len(raw).to_bytes(8, "big"))
+        digest.update(raw)
+
+print(digest.hexdigest())
+PY
+)
 
 cleanup() {
   if [ "${INFOTHEORY_BENCH_KEEP_WORKDIR:-0}" = "1" ]; then
@@ -71,8 +163,8 @@ usage() {
   cat <<EOF
 Usage: sh ./scripts/bench_two_json.sh
 
-Runs a sequential benchmark suite for every standalone expert in ${SUITE_DISPLAY}
-plus the full neural mixture, using only /tmp/enwik7 as the source corpus.
+Runs a sequential benchmark suite for subjects derived from ${SUITE_DISPLAY},
+using only /tmp/enwik7 as the source corpus.
 
 Resume behavior:
   By default, resumes the newest /tmp/${SUITE_PATH_PREFIX}-raw-*.tsv if one exists.
@@ -81,13 +173,14 @@ Resume behavior:
   or append to a specific run file.
 
 Environment:
-  INFOTHEORY_BENCH_SUITE=two-json|extra
+  INFOTHEORY_BENCH_SUITE=two-json|one-sse|extra|three-json
   INFOTHEORY_BENCH_REPEATS=3
   INFOTHEORY_BENCH_WARMUPS=1
   INFOTHEORY_BENCH_SIZES="4096 16384 ... 10000000"
   INFOTHEORY_BENCH_SUBJECTS=rwkv7
   INFOTHEORY_BENCH_FEATURES="cli backend-rwkv"
   INFOTHEORY_BENCH_BUILD_MODE=native|portable
+  INFOTHEORY_BENCH_OPERATIONS="h compress decompress"
   INFOTHEORY_BENCH_CPU=11
   INFOTHEORY_BENCH_COMPRESSION_BACKEND=rate-ac
   INFOTHEORY_BENCH_WORKDIR_ROOT=/var/tmp
@@ -131,6 +224,24 @@ case " ${BENCH_FEATURES} " in
   *" cli "*) ;;
   *) BENCH_FEATURES="cli ${BENCH_FEATURES}" ;;
 esac
+
+BENCH_OPERATIONS=$(printf '%s' "${BENCH_OPERATIONS}" | tr ',' ' ' | xargs)
+[ -n "${BENCH_OPERATIONS}" ] || BENCH_OPERATIONS="h compress decompress"
+for op in ${BENCH_OPERATIONS}; do
+  case "${op}" in
+    h|compress|decompress) ;;
+    *)
+      fail "INFOTHEORY_BENCH_OPERATIONS may only contain h, compress, and decompress (found '${op}')"
+      ;;
+  esac
+done
+
+op_enabled() {
+  case " ${BENCH_OPERATIONS} " in
+    *" $1 "*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
 
 case "${BENCH_BUILD_MODE}" in
   native|portable) ;;
@@ -336,11 +447,6 @@ subject_dir = work_dir / "subjects"
 subject_dir.mkdir(parents=True, exist_ok=True)
 
 data = json.loads(spec_path.read_text())
-if data.get("kind") != "neural":
-    raise SystemExit(f"expected {suite_label} kind=neural, found {data.get('kind')!r}")
-experts = data.get("experts")
-if not isinstance(experts, list) or not experts:
-    raise SystemExit(f"{suite_label} must contain a non-empty experts array")
 spec_dir = spec_path.parent
 
 PATH_KEYS = {
@@ -352,29 +458,20 @@ PATH_KEYS = {
     "mamba_model_path",
 }
 
+MIXTURE_KINDS = {
+    "bayes",
+    "fading-bayes",
+    "switching",
+    "convex",
+    "mdl",
+    "neural",
+    "logistic",
+}
+
 
 def looks_like_uri(value: str) -> bool:
     return bool(re.match(r"^[A-Za-z][A-Za-z0-9+.-]*:", value))
 
-
-def canonicalize_relative_paths(node):
-    if isinstance(node, dict):
-        out = {}
-        for key, value in node.items():
-            if (
-                isinstance(value, str)
-                and value
-                and (key in PATH_KEYS or key.endswith("_path"))
-                and not Path(value).is_absolute()
-                and not looks_like_uri(value)
-            ):
-                out[key] = str((spec_dir / value).resolve())
-            else:
-                out[key] = canonicalize_relative_paths(value)
-        return out
-    if isinstance(node, list):
-        return [canonicalize_relative_paths(item) for item in node]
-    return node
 
 def slug(text: str) -> str:
     text = re.sub(r"[^A-Za-z0-9._-]+", "-", text.strip())
@@ -390,36 +487,123 @@ def canonical_subject_name(expert):
         return "fac-ctw"
     return name
 
+def resolve_path_like(value: str, base_dir: Path) -> Path:
+    candidate = Path(value)
+    if candidate.is_absolute():
+        return candidate.resolve()
+    if looks_like_uri(value):
+        raise SystemExit(f"{suite_label}: URI paths are not supported in benchmark suite files")
+    return (base_dir / candidate).resolve()
+
+def load_mixture(path: Path, label: str):
+    value = json.loads(path.read_text())
+    if value.get("kind") not in MIXTURE_KINDS:
+        raise SystemExit(
+            f"expected {label} kind to be a mixture kind, found {value.get('kind')!r}"
+        )
+    experts_value = value.get("experts")
+    if not isinstance(experts_value, list) or not experts_value:
+        raise SystemExit(f"{label} must contain a non-empty experts array")
+    return value, experts_value, path.parent
+
+def find_mixture_spec_path(node, base_dir: Path):
+    if not isinstance(node, dict):
+        return None
+    kind = node.get("kind")
+    if kind == "mixture":
+        spec_ref = node.get("spec_path")
+        if isinstance(spec_ref, str) and spec_ref:
+            return resolve_path_like(spec_ref, base_dir)
+        return None
+    if kind == "calibrated":
+        spec = node.get("spec")
+        if isinstance(spec, dict):
+            found = find_mixture_spec_path(spec.get("base"), base_dir)
+            if found is not None:
+                return found
+    found = find_mixture_spec_path(node.get("base"), base_dir)
+    if found is not None:
+        return found
+    spec = node.get("spec")
+    if isinstance(spec, dict):
+        return find_mixture_spec_path(spec.get("base"), base_dir)
+    return None
+
+def emit_experts(experts_value, expert_base_dir):
+    for expert in experts_value:
+        expert_resolved = canonicalize_relative_paths_with_base(expert, expert_base_dir)
+        name = canonical_subject_name(expert_resolved)
+        subject = slug(name)
+        out_path = subject_dir / f"{subject}.json"
+        out_path.write_text(json.dumps(expert_resolved, indent=2, sort_keys=True) + "\n")
+        h_order = expert_resolved.get("max_order", "")
+        print(
+            "\t".join(
+                [
+                    subject,
+                    "expert",
+                    str(expert_resolved.get("kind", "")),
+                    str(out_path),
+                    "" if h_order == "" else str(h_order),
+                ]
+            )
+        )
+
+def canonicalize_relative_paths_with_base(node, base_dir):
+    if isinstance(node, dict):
+        out = {}
+        for key, value in node.items():
+            if (
+                isinstance(value, str)
+                and value
+                and (key in PATH_KEYS or key.endswith("_path"))
+                and not Path(value).is_absolute()
+                and not looks_like_uri(value)
+            ):
+                out[key] = str((base_dir / value).resolve())
+            else:
+                out[key] = canonicalize_relative_paths_with_base(value, base_dir)
+        return out
+    if isinstance(node, list):
+        return [canonicalize_relative_paths_with_base(item, base_dir) for item in node]
+    return node
+
 print("subject\tsubject_kind\texpert_kind\tspec_path\th_order")
-print(
-    "\t".join(
-        [
-            "neural_mixture",
-            "mixture",
-            "neural-mixture",
-            str(spec_path),
-            "",
-        ]
-    )
-)
-for expert in experts:
-    expert_resolved = canonicalize_relative_paths(expert)
-    name = canonical_subject_name(expert_resolved)
-    subject = slug(name)
-    out_path = subject_dir / f"{subject}.json"
-    out_path.write_text(json.dumps(expert_resolved, indent=2, sort_keys=True) + "\n")
-    h_order = expert_resolved.get("max_order", "")
+
+if data.get("kind") in MIXTURE_KINDS:
+    mixture, experts, expert_dir = load_mixture(spec_path, suite_label)
+    mixture_kind = str(mixture.get("kind"))
     print(
         "\t".join(
             [
-                subject,
-                "expert",
-                str(expert_resolved.get("kind", "")),
-                str(out_path),
-                "" if h_order == "" else str(h_order),
+                f"{slug(mixture_kind)}_mixture",
+                "mixture",
+                f"{mixture_kind}-mixture",
+                str(spec_path),
+                "",
             ]
         )
     )
+    emit_experts(experts, expert_dir)
+else:
+    base_path = find_mixture_spec_path(data, spec_dir)
+    if base_path is None:
+        raise SystemExit(
+            f"expected {suite_label} to be a mixture spec or a calibrated chain over base.kind=mixture"
+        )
+    _, experts, expert_dir = load_mixture(base_path, f"{suite_label} base {base_path.name}")
+    print(
+        "\t".join(
+            [
+                "calibrated_mixture",
+                "calibrated",
+                "calibrated-mixture",
+                str(spec_path),
+                "",
+            ]
+        )
+    )
+    emit_experts(experts, expert_dir)
 PY
 
 if [ -n "${SUBJECT_FILTER}" ]; then
@@ -495,6 +679,9 @@ run_plain() {
     mixture)
       set -- "$@" --rate-backend mixture --method "${cmd_spec_path}"
       ;;
+    calibrated)
+      set -- "$@" --rate-backend calibrated --method "${cmd_spec_path}"
+      ;;
     expert)
       set -- "$@" --expert-spec "${cmd_spec_path}"
       ;;
@@ -546,6 +733,9 @@ run_timed() {
   case "${cmd_subject_kind}" in
     mixture)
       set -- "$@" --rate-backend mixture --method "${cmd_spec_path}"
+      ;;
+    calibrated)
+      set -- "$@" --rate-backend calibrated --method "${cmd_spec_path}"
       ;;
     expert)
       set -- "$@" --expert-spec "${cmd_spec_path}"
@@ -646,6 +836,7 @@ say "[bench] CPU affinity: ${CPU}"
 say "[bench] Compression backend: ${COMP_BACKEND}"
 say "[bench] Build mode: ${BENCH_BUILD_MODE}"
 say "[bench] Build features: ${BENCH_FEATURES}"
+say "[bench] Operations: ${BENCH_OPERATIONS}"
 say "[bench] Repeats: ${REPEATS}"
 say "[bench] Warmups: ${WARMUPS}"
 say "[bench] Sizes: ${SIZES}"
@@ -687,15 +878,15 @@ for size_bytes in ${SIZES}; do
     need_subject_work=0
     rep=1
     while [ "${rep}" -le "${REPEATS}" ]; do
-      if ! row_exists "h" "${subject}" "${size_bytes}" "${rep}" "${CPU}" "-" "${input_sha256}" "${SUITE_SPEC_SHA256}" "${BENCH_BUILD_MODE}" "${BENCH_FEATURES}"; then
+      if op_enabled h && ! row_exists "h" "${subject}" "${size_bytes}" "${rep}" "${CPU}" "-" "${input_sha256}" "${SUITE_SPEC_SHA256}" "${BENCH_BUILD_MODE}" "${BENCH_FEATURES}"; then
         need_subject_work=1
         break
       fi
-      if ! row_exists "compress" "${subject}" "${size_bytes}" "${rep}" "${CPU}" "${COMP_BACKEND}" "${input_sha256}" "${SUITE_SPEC_SHA256}" "${BENCH_BUILD_MODE}" "${BENCH_FEATURES}"; then
+      if op_enabled compress && ! row_exists "compress" "${subject}" "${size_bytes}" "${rep}" "${CPU}" "${COMP_BACKEND}" "${input_sha256}" "${SUITE_SPEC_SHA256}" "${BENCH_BUILD_MODE}" "${BENCH_FEATURES}"; then
         need_subject_work=1
         break
       fi
-      if ! row_exists "decompress" "${subject}" "${size_bytes}" "${rep}" "${CPU}" "${COMP_BACKEND}" "${input_sha256}" "${SUITE_SPEC_SHA256}" "${BENCH_BUILD_MODE}" "${BENCH_FEATURES}"; then
+      if op_enabled decompress && ! row_exists "decompress" "${subject}" "${size_bytes}" "${rep}" "${CPU}" "${COMP_BACKEND}" "${input_sha256}" "${SUITE_SPEC_SHA256}" "${BENCH_BUILD_MODE}" "${BENCH_FEATURES}"; then
         need_subject_work=1
         break
       fi
@@ -713,10 +904,16 @@ for size_bytes in ${SIZES}; do
     while [ "${warmup_idx}" -le "${WARMUPS}" ]; do
       archive_path="${WORK_DIR}/warmup-${subject}-${size_bytes}.itc"
       restored_path="${WORK_DIR}/warmup-${subject}-${size_bytes}.out"
-      run_plain h "${input_path}" "${WORK_DIR}/unused" "${subject_kind}" "${spec_path}" "${h_order}"
-      run_plain compress "${input_path}" "${archive_path}" "${subject_kind}" "${spec_path}" "${h_order}"
-      run_plain decompress "${archive_path}" "${restored_path}" "${subject_kind}" "${spec_path}" "${h_order}"
-      cmp -s "${input_path}" "${restored_path}" || fail "Warmup round-trip failed for ${subject} at ${size_bytes} bytes"
+      if op_enabled h; then
+        run_plain h "${input_path}" "${WORK_DIR}/unused" "${subject_kind}" "${spec_path}" "${h_order}"
+      fi
+      if op_enabled compress || op_enabled decompress; then
+        run_plain compress "${input_path}" "${archive_path}" "${subject_kind}" "${spec_path}" "${h_order}"
+      fi
+      if op_enabled decompress; then
+        run_plain decompress "${archive_path}" "${restored_path}" "${subject_kind}" "${spec_path}" "${h_order}"
+        cmp -s "${input_path}" "${restored_path}" || fail "Warmup round-trip failed for ${subject} at ${size_bytes} bytes"
+      fi
       rm -f "${archive_path}" "${restored_path}"
       warmup_idx=$((warmup_idx + 1))
     done
@@ -734,13 +931,13 @@ for size_bytes in ${SIZES}; do
       need_decompress=0
       archive_ready=0
 
-      if ! row_exists "h" "${subject}" "${size_bytes}" "${rep}" "${CPU}" "-" "${input_sha256}" "${SUITE_SPEC_SHA256}" "${BENCH_BUILD_MODE}" "${BENCH_FEATURES}"; then
+      if op_enabled h && ! row_exists "h" "${subject}" "${size_bytes}" "${rep}" "${CPU}" "-" "${input_sha256}" "${SUITE_SPEC_SHA256}" "${BENCH_BUILD_MODE}" "${BENCH_FEATURES}"; then
         need_h=1
       fi
-      if ! row_exists "compress" "${subject}" "${size_bytes}" "${rep}" "${CPU}" "${COMP_BACKEND}" "${input_sha256}" "${SUITE_SPEC_SHA256}" "${BENCH_BUILD_MODE}" "${BENCH_FEATURES}"; then
+      if op_enabled compress && ! row_exists "compress" "${subject}" "${size_bytes}" "${rep}" "${CPU}" "${COMP_BACKEND}" "${input_sha256}" "${SUITE_SPEC_SHA256}" "${BENCH_BUILD_MODE}" "${BENCH_FEATURES}"; then
         need_compress=1
       fi
-      if ! row_exists "decompress" "${subject}" "${size_bytes}" "${rep}" "${CPU}" "${COMP_BACKEND}" "${input_sha256}" "${SUITE_SPEC_SHA256}" "${BENCH_BUILD_MODE}" "${BENCH_FEATURES}"; then
+      if op_enabled decompress && ! row_exists "decompress" "${subject}" "${size_bytes}" "${rep}" "${CPU}" "${COMP_BACKEND}" "${input_sha256}" "${SUITE_SPEC_SHA256}" "${BENCH_BUILD_MODE}" "${BENCH_FEATURES}"; then
         need_decompress=1
       fi
 

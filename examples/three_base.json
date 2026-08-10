@@ -1,0 +1,70 @@
+{
+  "kind": "logistic",
+  "alpha": 0.02,
+  "experts": [
+    {
+      "name": "fac-ctw",
+      "kind": "fac-ctw",
+      "base_depth": 32,
+      "num_percept_bits": 8,
+      "encoding_bits": 8,
+      "msb_first": true,
+      "log_prior": 0.0
+    },
+    {
+      "name": "ppmd",
+      "kind": "ppmd",
+      "order": 12,
+      "memory_mb": 256,
+      "log_prior": 0.0
+    },
+    {
+      "name": "rosa",
+      "kind": "rosaplus",
+      "max_order": -1,
+      "log_prior": 0.0
+    },
+    {
+      "name": "match",
+      "kind": "match",
+      "log_prior": 0.0
+    },
+    {
+      "name": "sparse-match",
+      "kind": "sparse-match",
+      "log_prior": 0.0
+    },
+    {
+      "name": "order1",
+      "kind": "order-ngram",
+      "order": 1,
+      "hash_bits": 14,
+      "log_prior": 0.0
+    },
+    {
+      "name": "order2",
+      "kind": "order-ngram",
+      "order": 2,
+      "hash_bits": 16,
+      "log_prior": 0.0
+    },
+    {
+      "name": "order3",
+      "kind": "order-ngram",
+      "order": 3,
+      "hash_bits": 17,
+      "log_prior": 0.0
+    },
+    {
+      "name": "word-context",
+      "kind": "word-context",
+      "hash_bits": 16,
+      "log_prior": 0.0
+    },
+    {
+      "name": "bit-reservoir",
+      "kind": "bit-reservoir",
+      "log_prior": 0.0
+    }
+  ]
+}

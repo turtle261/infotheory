@@ -148,10 +148,24 @@ pub(crate) struct TextContextAnalyzer {
     bracket_stack: [u8; 8],
     bracket_depth: usize,
     repeat: LocalRepeatState,
+    track_repeats: bool,
 }
 
 impl TextContextAnalyzer {
     pub(crate) fn new() -> Self {
+        Self {
+            track_repeats: true,
+            ..Self::default()
+        }
+    }
+
+    /// Construct an analyzer that omits local-copy tracking.
+    ///
+    /// This is used by predictors that consume only lexical/structural fields;
+    /// it avoids maintaining a redundant match table and keeps checkpoints
+    /// constant-size in the length of the observed stream.
+    #[cfg(feature = "backend-context")]
+    pub(crate) fn without_repeat_tracking() -> Self {
         Self::default()
     }
 
@@ -160,8 +174,13 @@ impl TextContextAnalyzer {
     }
 
     pub(crate) fn update(&mut self, symbol: u8) {
-        let was_predicted = self.repeat.predicted;
-        self.repeat.update(symbol);
+        let was_predicted: Option<u8> = if self.track_repeats {
+            let predicted: Option<u8> = self.repeat.predicted;
+            self.repeat.update(symbol);
+            predicted
+        } else {
+            None
+        };
 
         let byte_class = classify_byte(symbol);
         if self.state.has_history && symbol == self.state.prev1 {
@@ -191,7 +210,11 @@ impl TextContextAnalyzer {
         self.state.prev1 = symbol;
         self.state.prev1_class = byte_class;
         self.state.utf8_left = utf8_left_after(symbol, self.state.utf8_left);
-        self.state.repeat_len_bucket = self.repeat.repeat_len_bucket();
+        self.state.repeat_len_bucket = if self.track_repeats {
+            self.repeat.repeat_len_bucket()
+        } else {
+            0
+        };
         self.state.copied_last_byte = was_predicted == Some(symbol);
         self.state.has_history = true;
     }
@@ -266,12 +289,12 @@ pub(crate) fn classify_byte(byte: u8) -> u8 {
 }
 
 #[inline]
-fn is_word_byte(byte: u8) -> bool {
+pub(crate) fn is_word_byte(byte: u8) -> bool {
     matches!(byte, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | 0x80..=0xFF)
 }
 
 #[inline]
-fn bucket_word_len(len: u16) -> u8 {
+pub(crate) fn bucket_word_len(len: u16) -> u8 {
     match len {
         0 => 0,
         1 => 1,

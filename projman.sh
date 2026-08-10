@@ -151,7 +151,9 @@ cmd_lean_test() {
   say "[lean_test] Building + running Lean validation (ite-bench)..."
   need_cmd lake
 
-  (cd "$ROOT_DIR/ite-bench" && lake build)
+  # Full runner: reuse existing native artifact when up to date; do not force
+  # a clean rebuild here (Runner.c.o alone can exceed 20GB RSS).
+  (cd "$ROOT_DIR/ite-bench" && LEAN_NUM_THREADS=1 lake build runner)
   (cd "$ROOT_DIR/ite-bench" && lake exe runner)
 
   say "[lean_test] Done"
@@ -194,13 +196,23 @@ cmd_bench() {
       suite=two-json
       shift
       ;;
+    one-sse|one_sse|one)
+      suite=one-sse
+      shift
+      ;;
     extra)
       suite=extra
       shift
       ;;
+    three-json|three_json|three)
+      suite=three-json
+      shift
+      ;;
   esac
   case "${suite}" in
+    one-sse) suite_display="configs/bench/one_sse.json" ;;
     extra) suite_display="configs/bench/extra.json" ;;
+    three-json) suite_display="configs/bench/three.json" ;;
     *) suite=two-json; suite_display="configs/bench/two.json" ;;
   esac
   say "[bench] Running ${suite_display} benchmark suite..."
@@ -268,13 +280,23 @@ cmd_plot() {
       suite=two-json
       shift
       ;;
+    one-sse|one_sse|one)
+      suite=one-sse
+      shift
+      ;;
     extra)
       suite=extra
       shift
       ;;
+    three-json|three_json|three)
+      suite=three-json
+      shift
+      ;;
   esac
   case "${suite}" in
+    one-sse) suite_display="configs/bench/one_sse.json" ;;
     extra) suite_display="configs/bench/extra.json" ;;
+    three-json) suite_display="configs/bench/three.json" ;;
     *) suite=two-json; suite_display="configs/bench/two.json" ;;
   esac
   say "[plot] Legacy plot generation is superseded by the benchman TUI."
@@ -318,8 +340,16 @@ cmd_tui() {
       suite=two-json
       shift
       ;;
+    one-sse|one_sse|one)
+      suite=one-sse
+      shift
+      ;;
     extra)
       suite=extra
+      shift
+      ;;
+    three-json|three_json|three)
+      suite=three-json
       shift
       ;;
   esac
@@ -377,12 +407,12 @@ usage() {
 Usage: ./projman.sh <command>
 
 Commands:
-  bench [suite]  Run benchmark suite (`two-json` default, or `extra`). Requires /tmp/enwik7 to exist and be exactly 10000000 bytes. Resumes the newest raw TSV for the selected suite by default; set INFOTHEORY_BENCH_FRESH=1 for a new run. Not included in test_all.
+  bench [suite]  Run benchmark suite (`two-json` default, `one-sse`, `extra`, or `three-json`). Requires /tmp/enwik7 to exist and be exactly 10000000 bytes. Resumes the newest raw TSV for the selected suite by default; set INFOTHEORY_BENCH_FRESH=1 for a new run. Not included in test_all.
   bench cli <baseline-commit> [preset]  Build baseline vs dirty current trees and compare CLI workloads with hyperfine. Presets: `default` (signal-focused defaults) and `quick` (same matrix with lighter defaults). Writes artifacts under /var/tmp/infotheory_bench/.
   bench mcts <baseline-commit> [--root <dir>]  Run Criterion planner benchmarks (`mcts_planners`) on a baseline worktree and current tree, then enforce Tranche 3.5 Part 1 regression gates (rho_uct >=5%, parallel >=10% fail).
   bench_aixi_competitors  Run reproducible Guix time-machine benchmark for Infotheory MC-AIXI (Rust+Python) vs PyAIXI and C++ MC-AIXI. Fails fast if Guix is unavailable.
-  plot [suite]   Open benchmark results in the benchman TUI for the selected suite (`two-json` default, or `extra`). Not included in test_all.
-  tui [suite]    Build and launch the interactive benchmark TUI (`benchman`) for the selected suite (`two-json` default, or `extra`). Supports --summary-tsv/--baseline-summary-tsv/--raw-tsv/--subjects and manages /tmp/plotimgs.
+  plot [suite]   Open benchmark results in the benchman TUI for the selected suite (`two-json` default, `one-sse`, `extra`, or `three-json`). Not included in test_all.
+  tui [suite]    Build and launch the interactive benchmark TUI (`benchman`) for the selected suite (`two-json` default, `one-sse`, `extra`, or `three-json`). Supports --summary-tsv/--baseline-summary-tsv/--raw-tsv/--subjects and manages /tmp/plotimgs.
   tui log-loss <prefix>  Build and launch the log-loss diagnostic TUI for <prefix>.trace.tsv / .nodes.tsv / .summary.tsv.
   tui man     Open the local benchman manual via nvim man pager (MANPAGER='nvim +Man!').
   code_test   Build (release) and run Rust tests (release). Uses --features vm iff VM artifacts exist and /dev/kvm is accessible.
@@ -396,9 +426,9 @@ Commands:
 
 Environment variables:
   INFOTHEORY_BUILD_MODE=native|portable  Controls local cargo invocations in projman. `native` uses the repository's default target-cpu=native configuration; `portable` overrides local builds/tests to use generic CPU codegen like CI/release builds.
-  INFOTHEORY_BENCH_*  Passed through to scripts/bench_two_json.sh for benchmark tuning/output paths, including INFOTHEORY_BENCH_SUBJECTS=rwkv7, INFOTHEORY_BENCH_SUITE=extra, and INFOTHEORY_BENCH_BUILD_MODE=native|portable.
+  INFOTHEORY_BENCH_*  Passed through to scripts/bench_two_json.sh for benchmark tuning/output paths, including INFOTHEORY_BENCH_SUBJECTS=rwkv7, INFOTHEORY_BENCH_SUITE=one-sse|extra|three-json, and INFOTHEORY_BENCH_BUILD_MODE=native|portable.
   INFOTHEORY_CLI_BENCH_*  Passed through to scripts/bench_cli_hyperfine.sh for baseline/current CLI benchmark tuning and input selection. For `projman.sh bench cli`, INFOTHEORY_BUILD_MODE is canonical and is forwarded as INFOTHEORY_CLI_BENCH_BUILD_MODE.
-  INFOTHEORY_PLOT_*   Passed through to scripts/plot_two_json.sh, including INFOTHEORY_PLOT_SUBJECTS=rwkv7, INFOTHEORY_PLOT_SUMMARY_TSV=..., and INFOTHEORY_PLOT_SUITE=extra.
+  INFOTHEORY_PLOT_*   Passed through to scripts/plot_two_json.sh, including INFOTHEORY_PLOT_SUBJECTS=rwkv7, INFOTHEORY_PLOT_SUMMARY_TSV=..., and INFOTHEORY_PLOT_SUITE=one-sse|extra|three-json.
   INFOTHEORY_BASELINE_SUMMARY_TSV / INFOTHEORY_BENCH_RAW_TSV  Also read by benchman for baseline overlays and raw inspector detail.
   SKIP_DOCKER=1   Skip docker rootfs.ext4 build during init-vm.
   BUILD_CLI=1     Also build optional infotheory CLI binary (feature: cli) during code_test.
